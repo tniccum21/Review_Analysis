@@ -428,7 +428,7 @@ def create_analytics_dashboard(df: pd.DataFrame):
         if products_df is not None:
             df_processed = df_processed.merge(
                 products_df[['PRODUCT_SKU_TEXT_UPPER', 'GENDER_CODE', 'PRODUCT_CLASS_CODE', 'PRODUCT_SUB_CLASS_CODE', 
-                             'GENDER_TEXT', 'PRODUCT_CLASS_TEXT', 'PRODUCT_SUB_CLASS_TEXT']],
+                             'END_USE_CODE', 'GENDER_TEXT', 'PRODUCT_CLASS_TEXT', 'PRODUCT_SUB_CLASS_TEXT', 'END_USE_TEXT']],
                 left_on='product_upper',
                 right_on='PRODUCT_SKU_TEXT_UPPER',
                 how='left'
@@ -446,7 +446,7 @@ def create_analytics_dashboard(df: pd.DataFrame):
     # --- 2. Product Metadata Filters ---
     st.markdown("#### Filters")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     # Gender filter
     with col1:
@@ -472,6 +472,14 @@ def create_analytics_dashboard(df: pd.DataFrame):
         else:
             selected_subclass = 'All'
     
+    # End Use filter
+    with col4:
+        if 'END_USE_CODE' in df_processed.columns:
+            end_use_options = ['All'] + sorted(df_processed['END_USE_CODE'].dropna().unique().tolist())
+            selected_end_use = st.selectbox("End Use:", options=end_use_options)
+        else:
+            selected_end_use = 'All'
+    
     # Apply filters
     dff = df_processed.copy()
     
@@ -483,6 +491,9 @@ def create_analytics_dashboard(df: pd.DataFrame):
     
     if selected_subclass != 'All' and 'PRODUCT_SUB_CLASS_CODE' in dff.columns:
         dff = dff[dff['PRODUCT_SUB_CLASS_CODE'] == selected_subclass]
+    
+    if selected_end_use != 'All' and 'END_USE_CODE' in dff.columns:
+        dff = dff[dff['END_USE_CODE'] == selected_end_use]
 
     if dff.empty:
         st.warning("No data available for the selected filters.")
