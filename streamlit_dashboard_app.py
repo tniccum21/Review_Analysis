@@ -1797,7 +1797,7 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 st.error(metrics['error'])
                 return
             
-            st.success(f"✅ Computed metrics for {metrics['products_analyzed']} products across {metrics['total_reviews']} reviews")
+            st.success(f"✅ Computed metrics for {metrics.get('groups_analyzed', metrics.get('products_analyzed', 0))} groups across {metrics['total_reviews']} reviews")
         
         with st.spinner("Preparing LLM payload..."):
             # Prepare payload
