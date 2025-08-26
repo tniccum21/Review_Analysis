@@ -180,7 +180,7 @@ def process_reviews_batch(
                 'date': date, 'product': product_id, 'rating': rating,
                 'sentiment': sentiment, 'problems_mentioned': problems_str,
                 'positive_mentions': positives_str,
-                'original_text': review_text
+                'original_text': full_text  # Save the full text that was analyzed, not just review_text
             })
         except Exception as e:
             errors.append(f"Unexpected error at Index {idx}: {e}")

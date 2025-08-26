@@ -163,3 +163,6 @@ cache/
 *.mp3
 *.wav
 *.ogg
+
+# Analysis result files
+analysis_results_*.csv
