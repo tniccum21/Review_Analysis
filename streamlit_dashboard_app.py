@@ -1868,16 +1868,20 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                             st.caption(f"  Products: {', '.join(topic['products'][:5])}")
             
             with tabs[1]:  # Highlights
-                if 'product_highlights' in analysis and analysis['product_highlights']:
-                    st.markdown("##### Product Highlights")
-                    for highlight in analysis['product_highlights']:
+                # Check for both 'group_highlights' (new) and 'product_highlights' (old)
+                highlights = analysis.get('group_highlights', analysis.get('product_highlights', []))
+                if highlights:
+                    st.markdown("##### Highlights")
+                    for highlight in highlights:
                         z_score = highlight.get('z', 0)
                         severity = "🔴" if abs(z_score) > 3 else "🟡" if abs(z_score) > 2 else "🟢"
-                        st.write(f"{severity} **{highlight.get('product', 'Unknown')}**")
+                        # Handle both 'group' (new) and 'product' (old) fields
+                        group_name = highlight.get('group', highlight.get('product', 'Unknown'))
+                        st.write(f"{severity} **{group_name}**")
                         st.write(f"  Issue: {highlight.get('issue', 'Unknown')}")
                         st.caption(f"  Z-score: {z_score:.2f} | Change: {highlight.get('delta_pct', 'N/A')}")
                 else:
-                    st.info("No significant product highlights detected")
+                    st.info("No significant highlights detected")
             
             with tabs[2]:  # Risks
                 if 'risk_watchlist' in analysis and analysis['risk_watchlist']:
