@@ -8,12 +8,16 @@ import streamlit as st
 import pandas as pd
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, List, Any
 import plotly.express as px
 import plotly.graph_objects as go
 import glob
 import re
 from collections import Counter
+import json
+import requests
+import numpy as np
+from scipy import stats
 try:
     from wordcloud import WordCloud
     import matplotlib.pyplot as plt
@@ -1202,6 +1206,554 @@ def create_wordcloud_visualization(df: pd.DataFrame):
     except Exception as e:
         st.error(f"Error generating word cloud: {e}")
 
+def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str, Any]:
+    """Compute aggregated metrics for AI analysis"""
+    
+    # Convert date to datetime and create period column
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    
+    if granularity == 'week':
+        df['period'] = df['date'].dt.to_period('W').dt.start_time
+    else:  # month
+        df['period'] = df['date'].dt.to_period('M').dt.start_time
+    
+    # Filter out rows with invalid dates
+    df = df.dropna(subset=['date', 'period'])
+    
+    if df.empty:
+        return {'error': 'No valid data after date processing'}
+    
+    # Create sentiment binary columns
+    df['is_positive'] = df['sentiment'] == 'Positive'
+    df['is_negative'] = df['sentiment'] == 'Negative'
+    df['is_neutral'] = df['sentiment'] == 'Neutral'
+    
+    # Group by period and product
+    group_cols = ['period', 'product']
+    if 'product_description' in df.columns:
+        group_cols.append('product_description')
+    
+    # Basic aggregations
+    agg_dict = {
+        'sentiment': 'size',  # count reviews
+        'rating': 'mean',
+        'is_positive': 'mean',
+        'is_negative': 'mean',
+        'is_neutral': 'mean'
+    }
+    
+    agg_df = df.groupby(group_cols).agg(agg_dict).reset_index()
+    agg_df.columns = ['period', 'product'] + (['product_description'] if 'product_description' in group_cols else []) + \
+                      ['n_reviews', 'avg_rating', 'p_pos', 'p_neg', 'p_neu']
+    
+    # Process problem and positive mentions
+    problem_counts = []
+    positive_counts = []
+    
+    for (period, product), group in df.groupby(['period', 'product']):
+        # Count problems
+        problems = {}
+        for prob_str in group['problems_mentioned'].dropna():
+            if prob_str and prob_str != 'None':
+                for p in str(prob_str).split(';'):
+                    p = p.strip()
+                    if p and p != 'None':
+                        problems[p] = problems.get(p, 0) + 1
+        
+        # Count positives
+        positives = {}
+        for pos_str in group['positive_mentions'].dropna():
+            if pos_str and pos_str != 'None':
+                for p in str(pos_str).split(';'):
+                    p = p.strip()
+                    if p and p != 'None':
+                        positives[p] = positives.get(p, 0) + 1
+        
+        problem_counts.append({'period': period, 'product': product, 'problem_counts': problems})
+        positive_counts.append({'period': period, 'product': product, 'positive_counts': positives})
+    
+    # Merge problem and positive counts
+    problem_df = pd.DataFrame(problem_counts)
+    positive_df = pd.DataFrame(positive_counts)
+    
+    agg_df = agg_df.merge(problem_df, on=['period', 'product'], how='left')
+    agg_df = agg_df.merge(positive_df, on=['period', 'product'], how='left')
+    
+    # Fill missing counts with empty dicts
+    agg_df['problem_counts'] = agg_df['problem_counts'].fillna({}).apply(lambda x: x if x else {})
+    agg_df['positive_counts'] = agg_df['positive_counts'].fillna({}).apply(lambda x: x if x else {})
+    
+    # Calculate rolling baselines and z-scores
+    agg_df = agg_df.sort_values(['product', 'period'])
+    
+    # Rolling statistics for negative sentiment
+    agg_df['neg_roll_mean'] = agg_df.groupby('product')['p_neg'].transform(
+        lambda s: s.rolling(8, min_periods=4, center=False).mean()
+    )
+    agg_df['neg_roll_std'] = agg_df.groupby('product')['p_neg'].transform(
+        lambda s: s.rolling(8, min_periods=4, center=False).std()
+    )
+    
+    # Calculate z-score for negative sentiment
+    agg_df['z_neg'] = 0.0  # Initialize
+    mask = (agg_df['neg_roll_std'] > 0) & agg_df['neg_roll_mean'].notna()
+    agg_df.loc[mask, 'z_neg'] = (
+        (agg_df.loc[mask, 'p_neg'] - agg_df.loc[mask, 'neg_roll_mean']) / 
+        agg_df.loc[mask, 'neg_roll_std']
+    )
+    
+    # Calculate deltas vs baseline
+    agg_df['rating_delta'] = agg_df.groupby('product')['avg_rating'].transform(
+        lambda s: s - s.rolling(8, min_periods=4, center=False).mean()
+    )
+    agg_df['neg_delta_pct'] = agg_df.groupby('product')['p_neg'].transform(
+        lambda s: ((s / s.rolling(8, min_periods=4, center=False).mean()) - 1) * 100
+    )
+    
+    # Identify anomalies (|z| >= 2 or significant change)
+    agg_df['anomaly_flags'] = agg_df.apply(
+        lambda row: ['p_neg'] if abs(row.get('z_neg', 0)) >= 2 else [],
+        axis=1
+    )
+    
+    return {
+        'aggregated_data': agg_df,
+        'granularity': granularity,
+        'total_reviews': len(df),
+        'products_analyzed': df['product'].nunique(),
+        'date_range': f"{df['date'].min().strftime('%Y-%m-%d')} to {df['date'].max().strftime('%Y-%m-%d')}"
+    }
+
+def prepare_llm_payload(metrics: Dict[str, Any], top_n_products: int = 20) -> Dict[str, Any]:
+    """Prepare the compact JSON payload for LLM analysis"""
+    
+    agg_df = metrics['aggregated_data']
+    
+    # Get top products by review volume
+    top_products = (
+        agg_df.groupby('product')['n_reviews']
+        .sum()
+        .nlargest(top_n_products)
+        .index.tolist()
+    )
+    
+    # Filter to top products and recent periods
+    recent_df = agg_df[agg_df['product'].isin(top_products)].copy()
+    recent_df = recent_df.sort_values('period').tail(200)  # Last 200 data points
+    
+    # Build series data for JSON
+    series = []
+    for _, row in recent_df.iterrows():
+        series_item = {
+            'period': row['period'].strftime('%Y-%m-%d'),
+            'product': row['product'],
+            'n_reviews': int(row['n_reviews']),
+            'avg_rating': round(float(row['avg_rating']), 2) if pd.notna(row['avg_rating']) else None,
+            'p_pos': round(float(row['p_pos']), 3) if pd.notna(row['p_pos']) else 0,
+            'p_neu': round(float(row['p_neu']), 3) if pd.notna(row['p_neu']) else 0,
+            'p_neg': round(float(row['p_neg']), 3) if pd.notna(row['p_neg']) else 0,
+            'problem_counts': dict(row.get('problem_counts', {})),
+            'positive_counts': dict(row.get('positive_counts', {})),
+            'deltas': {
+                'rating_delta': round(float(row.get('rating_delta', 0)), 2) if pd.notna(row.get('rating_delta')) else 0,
+                'neg_delta_pct': round(float(row.get('neg_delta_pct', 0)), 1) if pd.notna(row.get('neg_delta_pct')) else 0
+            },
+            'z_scores': {
+                'p_neg': round(float(row.get('z_neg', 0)), 2) if pd.notna(row.get('z_neg')) else 0
+            },
+            'anomaly_flags': row.get('anomaly_flags', [])
+        }
+        series.append(series_item)
+    
+    # Build complete payload
+    payload = {
+        'meta': {
+            'analysis_date': datetime.now().strftime('%Y-%m-%d'),
+            'period': metrics.get('date_range', 'Unknown'),
+            'granularity': metrics.get('granularity', 'week'),
+            'total_reviews': metrics.get('total_reviews', 0),
+            'products_analyzed': len(top_products),
+            'anomaly_rules': {
+                'z_abs_threshold': 2.0,
+                'min_count': 15
+            }
+        },
+        'series': series
+    }
+    
+    return payload
+
+def create_ai_analysis_prompt(payload: Dict[str, Any]) -> tuple[str, str]:
+    """Create the structured prompt for LLM analysis"""
+    
+    system_prompt = """You are a senior retail analytics copilot. You ONLY use facts in the provided JSON.
+Prioritize statistically meaningful change. Avoid vague claims.
+When you cite a reason, name the metric(s) and the period(s) that moved."""
+    
+    user_prompt = f"""Goal: Find trends over time, surface anomalies, and explain likely drivers with supporting slices.
+
+Data: {json.dumps(payload, indent=2)}
+
+Rules:
+- Treat each row as period×product summary.
+- An anomaly requires min_count >= 15 AND |z| >= 2.0.
+- Prefer changes that persist >=2 periods.
+- Map problems/positives into themes if obvious.
+- If data are insufficient, say so explicitly.
+
+Output a structured JSON analysis followed by a brief narrative (8-12 lines):
+
+{{
+  "brand_trends": [
+    {{"theme":"<theme>","direction":"up/down","evidence":[{{"period":"YYYY-MM-DD","metric":"<metric>","value":<value>}}]}}
+  ],
+  "product_highlights": [
+    {{"product":"<product>", "issue":"<description>", "metric":"<metric>", "z":<z-score>, "delta_pct":"<change>", "periods":["YYYY-MM-DD"]}}
+  ],
+  "emerging_topics": [
+    {{"label":"<topic>","products":["<product>"],"trend":"<description>","support_trend":[<counts>]}}
+  ],
+  "risk_watchlist": [
+    {{"product":"<product>", "reason":"<explanation>", "action":"<recommendation>"}}
+  ],
+  "positive_drivers": [
+    {{"theme":"<theme>","products":["<product>"],"evidence":"<description>"}}
+  ]
+}}
+
+Then add a narrative that tells the story in plain English."""
+    
+    return system_prompt, user_prompt
+
+def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, str]) -> str:
+    """Call the LLM API (LM Studio or other providers)"""
+    
+    # Default to LM Studio endpoint
+    api_url = model_config.get('api_url', 'http://localhost:1234/v1/chat/completions')
+    api_key = model_config.get('api_key', 'not-needed')  # LM Studio doesn't need a real key
+    model_id = model_config.get('model_id', 'gemma-2-9b-it')
+    temperature = float(model_config.get('temperature', 0.1))
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    
+    data = {
+        'model': model_id,
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ],
+        'temperature': temperature,
+        'max_tokens': 2000
+    }
+    
+    try:
+        response = requests.post(api_url, headers=headers, json=data, timeout=60)
+        response.raise_for_status()
+        result = response.json()
+        return result['choices'][0]['message']['content']
+    except requests.exceptions.RequestException as e:
+        return f"Error calling LLM API: {str(e)}"
+    except (KeyError, IndexError) as e:
+        return f"Error parsing LLM response: {str(e)}"
+
+def parse_llm_response(response: str) -> Dict[str, Any]:
+    """Parse the LLM response to extract JSON and narrative"""
+    
+    # Try to find JSON block in the response
+    json_start = response.find('{')
+    json_end = response.rfind('}')
+    
+    if json_start != -1 and json_end != -1:
+        json_str = response[json_start:json_end + 1]
+        try:
+            analysis_json = json.loads(json_str)
+            # Extract narrative (everything after the JSON)
+            narrative = response[json_end + 1:].strip()
+            return {
+                'success': True,
+                'analysis': analysis_json,
+                'narrative': narrative,
+                'raw_response': response
+            }
+        except json.JSONDecodeError:
+            pass
+    
+    # Fallback if JSON parsing fails
+    return {
+        'success': False,
+        'analysis': {},
+        'narrative': response,
+        'raw_response': response
+    }
+
+def create_ai_analysis_tab(df: pd.DataFrame):
+    """Create the AI-powered analysis tab"""
+    
+    st.markdown("#### 🤖 AI-Powered Analysis")
+    
+    # Configuration section
+    with st.expander("⚙️ AI Analysis Configuration", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            granularity = st.selectbox(
+                "Time Granularity:",
+                ["week", "month"],
+                index=0,
+                help="Choose the time period for aggregation"
+            )
+        
+        with col2:
+            top_n = st.slider(
+                "Top N Products:",
+                min_value=5,
+                max_value=50,
+                value=20,
+                step=5,
+                help="Number of top products to analyze"
+            )
+        
+        with col3:
+            min_reviews = st.number_input(
+                "Min Reviews per Period:",
+                min_value=5,
+                max_value=100,
+                value=15,
+                step=5,
+                help="Minimum reviews required for statistical significance"
+            )
+    
+    # LLM Configuration
+    st.markdown("##### 🔧 LLM Configuration")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        provider = st.selectbox(
+            "LLM Provider:",
+            ["LM Studio (Local)", "OpenAI", "Custom API"],
+            index=0
+        )
+        
+        if provider == "LM Studio (Local)":
+            api_url = st.text_input(
+                "API URL:",
+                value="http://localhost:1234/v1/chat/completions",
+                help="Local LM Studio endpoint"
+            )
+            api_key = "not-needed"
+        elif provider == "OpenAI":
+            api_url = "https://api.openai.com/v1/chat/completions"
+            api_key = st.text_input(
+                "API Key:",
+                type="password",
+                help="Your OpenAI API key"
+            )
+        else:
+            api_url = st.text_input(
+                "API URL:",
+                help="Your custom API endpoint"
+            )
+            api_key = st.text_input(
+                "API Key:",
+                type="password",
+                help="API key if required"
+            )
+    
+    with col2:
+        # Try to fetch available models
+        available_models = []
+        if provider == "LM Studio (Local)":
+            try:
+                models_response = requests.get(
+                    api_url.replace('/v1/chat/completions', '/v1/models'),
+                    timeout=3
+                )
+                if models_response.status_code == 200:
+                    models_data = models_response.json()
+                    if 'data' in models_data:
+                        available_models = [m['id'] for m in models_data['data']]
+            except:
+                pass
+        
+        if available_models:
+            model_id = st.selectbox(
+                "Model:",
+                available_models,
+                index=0
+            )
+        else:
+            model_id = st.text_input(
+                "Model ID:",
+                value="gemma-2-9b-it" if provider == "LM Studio (Local)" else "gpt-4",
+                help="Model identifier"
+            )
+        
+        temperature = st.slider(
+            "Temperature:",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.1,
+            step=0.05,
+            help="Lower = more focused, Higher = more creative"
+        )
+    
+    # Analysis button and results
+    if st.button("🚀 Generate AI Analysis", type="primary"):
+        with st.spinner("Computing metrics..."):
+            # Compute metrics
+            metrics = compute_ai_metrics(df, granularity)
+            
+            if 'error' in metrics:
+                st.error(metrics['error'])
+                return
+            
+            st.success(f"✅ Computed metrics for {metrics['products_analyzed']} products across {metrics['total_reviews']} reviews")
+        
+        with st.spinner("Preparing LLM payload..."):
+            # Prepare payload
+            payload = prepare_llm_payload(metrics, top_n)
+            
+            # Show payload size
+            payload_str = json.dumps(payload)
+            token_estimate = len(payload_str) // 4  # Rough token estimate
+            st.info(f"📦 Payload size: {len(payload_str):,} characters (~{token_estimate:,} tokens)")
+        
+        with st.spinner("Calling LLM for analysis..."):
+            # Create prompt
+            system_prompt, user_prompt = create_ai_analysis_prompt(payload)
+            
+            # Call LLM
+            model_config = {
+                'api_url': api_url,
+                'api_key': api_key,
+                'model_id': model_id,
+                'temperature': temperature
+            }
+            
+            response = call_llm_api(system_prompt, user_prompt, model_config)
+            
+            # Parse response
+            parsed = parse_llm_response(response)
+        
+        # Display results
+        st.markdown("---")
+        st.markdown("### 📊 AI Analysis Results")
+        
+        if parsed['success']:
+            # Display structured analysis
+            analysis = parsed['analysis']
+            
+            # Create tabs for different insights
+            tabs = st.tabs(["📈 Trends", "🎯 Highlights", "⚠️ Risks", "✨ Positives", "📝 Narrative", "🔍 Raw Data"])
+            
+            with tabs[0]:  # Trends
+                if 'brand_trends' in analysis and analysis['brand_trends']:
+                    st.markdown("##### Brand Trends")
+                    for trend in analysis['brand_trends']:
+                        direction_icon = "📈" if trend.get('direction') == 'up' else "📉"
+                        st.write(f"{direction_icon} **{trend.get('theme', 'Unknown')}**: {trend.get('direction', 'Unknown')}")
+                        if 'evidence' in trend:
+                            for evidence in trend['evidence'][:3]:  # Show top 3 evidence points
+                                st.caption(f"  • {evidence.get('period', '')}: {evidence.get('metric', '')} = {evidence.get('value', '')}")
+                else:
+                    st.info("No significant brand trends detected")
+                
+                if 'emerging_topics' in analysis and analysis['emerging_topics']:
+                    st.markdown("##### Emerging Topics")
+                    for topic in analysis['emerging_topics']:
+                        st.write(f"🆕 **{topic.get('label', 'Unknown')}**: {topic.get('trend', 'Unknown')}")
+                        if 'products' in topic:
+                            st.caption(f"  Products: {', '.join(topic['products'][:5])}")
+            
+            with tabs[1]:  # Highlights
+                if 'product_highlights' in analysis and analysis['product_highlights']:
+                    st.markdown("##### Product Highlights")
+                    for highlight in analysis['product_highlights']:
+                        z_score = highlight.get('z', 0)
+                        severity = "🔴" if abs(z_score) > 3 else "🟡" if abs(z_score) > 2 else "🟢"
+                        st.write(f"{severity} **{highlight.get('product', 'Unknown')}**")
+                        st.write(f"  Issue: {highlight.get('issue', 'Unknown')}")
+                        st.caption(f"  Z-score: {z_score:.2f} | Change: {highlight.get('delta_pct', 'N/A')}")
+                else:
+                    st.info("No significant product highlights detected")
+            
+            with tabs[2]:  # Risks
+                if 'risk_watchlist' in analysis and analysis['risk_watchlist']:
+                    st.markdown("##### Risk Watchlist")
+                    for risk in analysis['risk_watchlist']:
+                        st.write(f"⚠️ **{risk.get('product', 'Unknown')}**")
+                        st.write(f"  Reason: {risk.get('reason', 'Unknown')}")
+                        st.info(f"  💡 Action: {risk.get('action', 'No recommendation')}")
+                else:
+                    st.success("No significant risks detected")
+            
+            with tabs[3]:  # Positives
+                if 'positive_drivers' in analysis and analysis['positive_drivers']:
+                    st.markdown("##### Positive Drivers")
+                    for driver in analysis['positive_drivers']:
+                        st.write(f"✅ **{driver.get('theme', 'Unknown')}**")
+                        if 'products' in driver:
+                            st.caption(f"  Products: {', '.join(driver['products'][:5])}")
+                        st.caption(f"  Evidence: {driver.get('evidence', 'No evidence')}")
+                else:
+                    st.info("No significant positive drivers detected")
+            
+            with tabs[4]:  # Narrative
+                st.markdown("##### AI Narrative Summary")
+                if parsed['narrative']:
+                    st.write(parsed['narrative'])
+                else:
+                    st.info("No narrative provided")
+            
+            with tabs[5]:  # Raw Data
+                st.markdown("##### Raw Analysis Data")
+                
+                # Show the metrics summary
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Reviews", f"{metrics['total_reviews']:,}")
+                with col2:
+                    st.metric("Products Analyzed", metrics['products_analyzed'])
+                with col3:
+                    st.metric("Date Range", metrics['date_range'])
+                
+                # Show the raw JSON analysis
+                with st.expander("View Raw JSON Analysis"):
+                    st.json(analysis)
+                
+                # Show aggregated data sample
+                with st.expander("View Aggregated Metrics (First 50 rows)"):
+                    st.dataframe(
+                        metrics['aggregated_data'].head(50),
+                        use_container_width=True
+                    )
+        else:
+            st.warning("⚠️ Could not parse structured analysis from LLM response")
+            st.markdown("##### Raw Response:")
+            st.text_area("", value=parsed['raw_response'], height=400)
+    
+    # Help section
+    with st.expander("ℹ️ About AI Analysis"):
+        st.markdown("""
+        This AI-powered analysis feature:
+        
+        1. **Aggregates your review data** into time periods (weekly/monthly)
+        2. **Computes statistical metrics** including z-scores and anomaly detection
+        3. **Sends a compact summary** to an LLM for intelligent analysis
+        4. **Returns structured insights** about trends, risks, and opportunities
+        
+        The analysis is based on the filtered data currently displayed in your dashboard.
+        
+        **Tips for best results:**
+        - Use at least 4-8 weeks of data for trend detection
+        - Focus on top products by review volume
+        - Adjust temperature based on your needs (0.0-0.2 for facts, 0.3-0.5 for insights)
+        """)
+
 def create_dashboard(df: pd.DataFrame):
     """Create the main dashboard with all visualizations"""
     st.markdown('<div class="section-header">📊 Interactive Dashboard</div>', unsafe_allow_html=True)
@@ -1211,15 +1763,16 @@ def create_dashboard(df: pd.DataFrame):
         st.warning("No data matches the selected filters.")
         return
     
-    # Create visualizations - Updated tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # Create visualizations - Updated tabs with AI Analysis
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Mentions Analysis", 
         "📝 Review Samples",
         "☁️ Word Cloud", 
         "😊 Sentiment Trend", 
         "⭐ Ratings", 
         "🚨 Problem Categories",
-        "✨ Positive Categories"
+        "✨ Positive Categories",
+        "🤖 AI Analysis"
     ])
     
     with tab1:
@@ -1243,6 +1796,9 @@ def create_dashboard(df: pd.DataFrame):
     
     with tab7:
         create_positive_categories_chart(df)
+    
+    with tab8:
+        create_ai_analysis_tab(df)
 
 def main():
     initialize_session_state()
