@@ -1268,8 +1268,14 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week', aggregation_
     }
     
     agg_df = df.groupby(group_cols).agg(agg_dict).reset_index()
+    # Use business-friendly column names
     agg_df.columns = ['period', 'group_key'] + (['product_description'] if 'product_description' in group_cols else []) + \
-                      ['n_reviews', 'avg_rating', 'p_pos', 'p_neg', 'p_neu']
+                      ['n_reviews', 'avg_rating', 'positive_feedback_rate', 'negative_feedback_rate', 'neutral_feedback_rate']
+    
+    # Keep original names for backward compatibility in calculations
+    agg_df['p_pos'] = agg_df['positive_feedback_rate']
+    agg_df['p_neg'] = agg_df['negative_feedback_rate']
+    agg_df['p_neu'] = agg_df['neutral_feedback_rate']
     
     # Process problem and positive mentions
     problem_counts = []
@@ -1375,18 +1381,19 @@ def prepare_llm_payload(metrics: Dict[str, Any], top_n_groups: int = 20) -> Dict
             'period': row['period'].strftime('%Y-%m-%d'),
             'group': row['group_key'],
             'n_reviews': int(row['n_reviews']),
-            'avg_rating': round(float(row['avg_rating']), 2) if pd.notna(row['avg_rating']) else None,
-            'p_pos': round(float(row['p_pos']), 3) if pd.notna(row['p_pos']) else 0,
-            'p_neu': round(float(row['p_neu']), 3) if pd.notna(row['p_neu']) else 0,
-            'p_neg': round(float(row['p_neg']), 3) if pd.notna(row['p_neg']) else 0,
+            'customer_rating': round(float(row['avg_rating']), 2) if pd.notna(row['avg_rating']) else None,
+            'positive_feedback_pct': round(float(row['positive_feedback_rate']) * 100, 1) if pd.notna(row['positive_feedback_rate']) else 0,
+            'neutral_feedback_pct': round(float(row['neutral_feedback_rate']) * 100, 1) if pd.notna(row['neutral_feedback_rate']) else 0,
+            'negative_feedback_pct': round(float(row['negative_feedback_rate']) * 100, 1) if pd.notna(row['negative_feedback_rate']) else 0,
             'problem_counts': dict(row.get('problem_counts', {})),
             'positive_counts': dict(row.get('positive_counts', {})),
             'deltas': {
                 'rating_delta': round(float(row.get('rating_delta', 0)), 2) if pd.notna(row.get('rating_delta')) else 0,
                 'neg_delta_pct': round(float(row.get('neg_delta_pct', 0)), 1) if pd.notna(row.get('neg_delta_pct')) else 0
             },
-            'z_scores': {
-                'p_neg': round(float(row.get('z_neg', 0)), 2) if pd.notna(row.get('z_neg')) else 0
+            'statistical_significance': {
+                'negative_feedback_unusual': abs(float(row.get('z_neg', 0))) >= 2.0 if pd.notna(row.get('z_neg')) else False,
+                'significance_level': 'high' if abs(float(row.get('z_neg', 0))) >= 3.0 else 'moderate' if abs(float(row.get('z_neg', 0))) >= 2.0 else 'normal'
             },
             'anomaly_flags': row.get('anomaly_flags', [])
         }
@@ -1414,58 +1421,69 @@ def prepare_llm_payload(metrics: Dict[str, Any], top_n_groups: int = 20) -> Dict
 def create_ai_analysis_prompt(payload: Dict[str, Any]) -> tuple[str, str]:
     """Create the structured prompt for LLM analysis"""
     
-    system_prompt = """You are a senior retail analytics copilot. You ONLY use facts in the provided JSON.
-Prioritize statistically meaningful change. Avoid vague claims.
-Output ONLY the requested JSON structure followed by a brief narrative. DO NOT include reasoning or explanations before the JSON."""
+    system_prompt = """You are a business intelligence assistant helping retail executives understand customer feedback trends.
+Write in clear, non-technical business language. Avoid statistical jargon like z-scores, p-values, or standard deviations.
+Focus on what matters to business leaders: customer satisfaction changes, emerging issues, and actionable insights.
+Output ONLY the requested JSON structure followed by a business executive summary."""
     
     aggregation_level = payload.get('meta', {}).get('aggregation_level', 'product')
     min_count = payload.get('meta', {}).get('anomaly_rules', {}).get('min_count', 10)
     
-    user_prompt = f"""Goal: Find trends over time, surface anomalies, and explain likely drivers.
+    user_prompt = f"""Analyze customer feedback trends and provide business insights.
 
 Data: {json.dumps(payload, indent=2)}
 
-Rules:
-- Each row is period×{aggregation_level} summary
-- Anomaly = min_count >= {min_count} AND |z| >= 2.0
-- Focus on changes persisting >=2 periods
-- If insufficient data, state in narrative
+Analysis Guidelines:
+- Look for significant changes in customer satisfaction (threshold: {min_count}+ reviews with notable shifts)
+- Identify patterns that persist for 2+ time periods
+- Translate data into business language (avoid technical statistics)
+- Focus on actionable insights for business leaders
 
-IMPORTANT: Output ONLY the JSON below (no reasoning), then a brief 8-line narrative:
+Create a JSON analysis with these insights:
 
 {{
   "brand_trends": [
-    {{"theme":"<theme>","direction":"up/down","evidence":[{{"period":"YYYY-MM-DD","metric":"<metric>","value":<value>}}]}}
+    {{"theme":"<business trend like 'Customer satisfaction improving'>","direction":"improving/declining","evidence":[{{"period":"YYYY-MM-DD","metric":"<business metric>","value":"<value with context>"}}]}}
   ],
   "group_highlights": [
-    {{"group":"<{aggregation_level}>", "issue":"<description>", "metric":"<metric>", "z":<z-score>, "delta_pct":"<change>", "periods":["YYYY-MM-DD"]}}
+    {{"group":"<{aggregation_level}>", "issue":"<business-friendly description like 'Sharp drop in satisfaction'>", "change":"<e.g., '15% decrease'>", "periods":["YYYY-MM-DD"]}}
   ],
   "emerging_topics": [
-    {{"label":"<topic>","groups":["<{aggregation_level}>"],"trend":"<description>","support_trend":[<counts>]}}
+    {{"label":"<business topic>","groups":["<{aggregation_level}>"],"trend":"<what's happening in business terms>"}}
   ],
   "risk_watchlist": [
-    {{"group":"<{aggregation_level}>", "reason":"<explanation>", "action":"<recommendation>"}}
+    {{"group":"<{aggregation_level}>", "reason":"<business risk explanation>", "action":"<business recommendation>"}}
   ],
   "positive_drivers": [
-    {{"theme":"<theme>","groups":["<{aggregation_level}>"],"evidence":"<description>"}}
+    {{"theme":"<what's working well>","groups":["<{aggregation_level}>"],"evidence":"<business evidence>"}}
+  ],
+  "negative_patterns": [
+    {{"theme":"<business problem>","groups":["<{aggregation_level}>"],"evidence":"<business impact>","severity":"high/medium/low"}}
   ]
 }}
 
-Then add a narrative that tells the story in plain English."""
+After the JSON, write an 8-line executive summary in business language that a CEO would understand."""
     
     return system_prompt, user_prompt
 
 def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, str]) -> str:
     """Call the LLM API (LM Studio or other providers) - using same pattern as analyze app"""
     
-    # Use environment variable with same default as analyze app
-    base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
-    
-    # Get API URL based on provider or use base URL
-    api_url = model_config.get('api_url', f'{base_url}/v1/chat/completions')
-    api_key = model_config.get('api_key', 'not-needed')  # LM Studio doesn't need a real key
+    # Get configuration from model_config
+    provider = model_config.get('provider', 'LM Studio (Local)')
+    api_url = model_config.get('api_url', '')
+    api_key = model_config.get('api_key', 'not-needed')
     model_id = model_config.get('model_id', 'gemma-2-9b-it')
     temperature = float(model_config.get('temperature', 0.1))
+    
+    # Handle provider-specific defaults if API URL is empty
+    if not api_url:
+        if provider == "OpenAI":
+            api_url = "https://api.openai.com/v1/chat/completions"
+        else:
+            # LM Studio or custom provider
+            base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+            api_url = f'{base_url}/v1/chat/completions'
     
     headers = {
         'Content-Type': 'application/json',
@@ -1475,23 +1493,86 @@ def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, s
     if api_key and api_key != 'not-needed':
         headers['Authorization'] = f'Bearer {api_key}'
     
+    # Use different parameter name for OpenAI vs other providers
+    max_tokens_param = 'max_completion_tokens' if provider == "OpenAI" else 'max_tokens'
+    
+    # Set a high token limit to avoid truncation
+    max_tokens = 50000  # High limit to ensure complete response
+    
+    # Build the request data
     data = {
         'model': model_id,
         'messages': [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt}
         ],
-        'temperature': temperature,
-        'max_tokens': 4000  # Increased to ensure JSON completion
+        max_tokens_param: max_tokens
     }
+    
+    # For OpenAI, only add temperature if it's not 1.0 (some models only support default)
+    # For other providers, always include temperature
+    if provider == "OpenAI":
+        if temperature != 1.0:
+            # Only add for models that support it
+            if not model_id.startswith('o1'):  # o1 models don't support temperature
+                data['temperature'] = temperature
+    else:
+        data['temperature'] = temperature
     
     try:
         response = requests.post(api_url, headers=headers, json=data, timeout=300)  # 5 minutes for large models
         response.raise_for_status()
         result = response.json()
-        return result['choices'][0]['message']['content']
+        
+        # Debug logging for empty responses
+        if not result.get('choices'):
+            return f"Error: No choices in response. Full response: {json.dumps(result)}"
+        
+        if not result['choices'][0].get('message'):
+            return f"Error: No message in response. Full response: {json.dumps(result)}"
+        
+        content = result['choices'][0]['message'].get('content', '')
+        if not content:
+            # Check if there's a refusal or other issue
+            if result['choices'][0].get('finish_reason') == 'content_filter':
+                return "Error: Content was filtered by OpenAI's safety system"
+            elif result['choices'][0].get('finish_reason') == 'length':
+                return "Error: Response was truncated due to length"
+            else:
+                return f"Error: Empty response from model. Finish reason: {result['choices'][0].get('finish_reason', 'unknown')}"
+        
+        return content
     except requests.exceptions.HTTPError as e:
-        return f"LLM API request failed: {str(e)}"
+        # Enhanced error handling for common issues
+        if e.response.status_code == 404:
+            if provider == "OpenAI":
+                try:
+                    error_detail = e.response.json().get('error', {}).get('message', '')
+                    if 'model' in error_detail.lower() or 'does not exist' in error_detail.lower():
+                        return f"OpenAI Error: Model '{model_id}' not found. Try 'gpt-4', 'gpt-4-turbo-preview', or 'gpt-3.5-turbo'"
+                    else:
+                        return f"OpenAI Error (404): {error_detail or 'Invalid endpoint or model. Check your model name.'}"
+                except:
+                    return f"OpenAI Error: Model '{model_id}' not found. Valid models: gpt-4, gpt-4-turbo-preview, gpt-3.5-turbo"
+            else:
+                return f"LLM API request failed (404): {str(e)}"
+        elif e.response.status_code == 401:
+            return f"Authentication failed: Invalid API key. Please check your API key."
+        elif e.response.status_code == 429:
+            try:
+                error_detail = e.response.json().get('error', {})
+                retry_after = e.response.headers.get('Retry-After', 'a few seconds')
+                return f"OpenAI Rate Limit: {error_detail.get('message', 'Too many requests')}. Wait {retry_after} before retrying. Consider using a paid API key or local models."
+            except:
+                return f"Rate limit exceeded: Too many requests. Wait 20-60 seconds before retrying. Consider using a paid OpenAI API key with higher limits."
+        elif e.response.status_code == 400:
+            try:
+                error_msg = e.response.json().get('error', {}).get('message', str(e))
+            except:
+                error_msg = str(e)
+            return f"Bad request: {error_msg}"
+        else:
+            return f"LLM API request failed: {str(e)}"
     except requests.exceptions.RequestException as e:
         return f"Failed to connect to LLM provider: {str(e)}"
     except (KeyError, IndexError) as e:
@@ -1706,10 +1787,6 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     default_model = os.getenv("AI_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
     default_temperature = float(os.getenv("AI_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.1")))
     
-    # If LM_STUDIO_HOST is set but not LLM_API_URL, use it as default
-    if not default_api_url and os.getenv("LM_STUDIO_HOST"):
-        default_api_url = f"{os.getenv('LM_STUDIO_HOST')}/v1/chat/completions"
-    
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1723,37 +1800,52 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             "LLM Provider:",
             provider_options,
             index=provider_index,
+            key="ai_provider_select",
             help="Set AI_LLM_PROVIDER env var to change default"
         )
         
         if provider == "LM Studio (Local)":
             # Use environment variable with fallback
             base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
-            default_url = default_api_url or f"{base_url}/v1/chat/completions"
+            # Only use env var if it's explicitly set for AI or generic LLM
+            if default_api_url and not default_api_url.startswith("http://169.254"):
+                default_url = default_api_url
+            else:
+                default_url = f"{base_url}/v1/chat/completions"
             api_url = st.text_input(
                 "API URL:",
                 value=default_url,
+                key="ai_api_url_lmstudio",
                 help="Set AI_LLM_API_URL or LM_STUDIO_HOST env var to change default"
             )
             api_key = default_api_key or "not-needed"
         elif provider == "OpenAI":
-            api_url = default_api_url or "https://api.openai.com/v1/chat/completions"
+            # For OpenAI, always use OpenAI endpoint unless explicitly overridden
+            api_url = st.text_input(
+                "API URL:",
+                value="https://api.openai.com/v1/chat/completions",
+                key="ai_api_url_openai",
+                help="OpenAI endpoint (usually doesn't need changing)"
+            )
             api_key = st.text_input(
                 "API Key:",
                 value=default_api_key,
                 type="password",
+                key="ai_api_key_openai",
                 help="Set AI_LLM_API_KEY env var to avoid entering each time"
             )
         else:
             api_url = st.text_input(
                 "API URL:",
                 value=default_api_url,
+                key="ai_api_url_custom",
                 help="Set AI_LLM_API_URL env var to change default"
             )
             api_key = st.text_input(
                 "API Key:",
                 value=default_api_key,
                 type="password",
+                key="ai_api_key_custom",
                 help="Set AI_LLM_API_KEY env var to avoid entering each time"
             )
     
@@ -1773,34 +1865,70 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 "Model:",
                 available_models,
                 index=model_index,
+                key="ai_model_select_lmstudio",
                 help="Set AI_LLM_MODEL_ID env var to change default"
             )
         else:
             # Use environment variable or provider-specific default
-            if default_model:
-                model_value = default_model
+            if provider == "OpenAI":
+                # For OpenAI, default to gpt-4 unless env var is set
+                model_value = default_model if default_model and default_model.startswith("gpt") else "gpt-4"
             elif provider == "LM Studio (Local)":
-                model_value = "gemma-2-9b-it"
+                model_value = default_model or "gemma-2-9b-it"
             else:
-                model_value = "gpt-4"
+                model_value = default_model or "gpt-4"
+            
+            # Use fixed keys based on provider to ensure proper widget updates
+            if provider == "OpenAI":
+                widget_key = "ai_model_input_openai"
+            elif provider == "LM Studio (Local)":
+                widget_key = "ai_model_input_lmstudio"
+            else:
+                widget_key = "ai_model_input_custom"
             
             model_id = st.text_input(
                 "Model ID:",
                 value=model_value,
+                key=widget_key,
                 help="Set AI_LLM_MODEL_ID env var to change default"
             )
+        
+        # Temperature slider with fixed keys
+        if provider == "OpenAI":
+            temp_key = "ai_temperature_openai"
+        elif provider == "LM Studio (Local)":
+            temp_key = "ai_temperature_lmstudio"
+        else:
+            temp_key = "ai_temperature_custom"
+            
+        # Temperature slider with provider-specific help text
+        if provider == "OpenAI":
+            help_text = "Note: Some OpenAI models (like o1) only support temperature=1.0"
+        else:
+            help_text = "Set AI_LLM_TEMPERATURE env var to change default (Lower = more focused, Higher = more creative)"
         
         temperature = st.slider(
             "Temperature:",
             min_value=0.0,
             max_value=1.0,
-            value=default_temperature,
+            value=default_temperature if provider != "OpenAI" else 1.0,
             step=0.05,
-            help="Set AI_LLM_TEMPERATURE env var to change default (Lower = more focused, Higher = more creative)"
+            key=temp_key,
+            help=help_text
         )
     
     # Analysis button and results
     if st.button("🚀 Generate AI Analysis", type="primary"):
+        # Store a flag to prevent duplicate API calls
+        if 'ai_analysis_in_progress' not in st.session_state:
+            st.session_state.ai_analysis_in_progress = False
+        
+        if st.session_state.ai_analysis_in_progress:
+            st.warning("Analysis already in progress. Please wait...")
+            return
+        
+        st.session_state.ai_analysis_in_progress = True
+        
         with st.spinner("Computing metrics..."):
             # Compute metrics
             metrics = compute_ai_metrics(df, granularity, aggregation_level)
@@ -1824,8 +1952,23 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             # Create prompt
             system_prompt, user_prompt = create_ai_analysis_prompt(payload)
             
+            # Show debug info and check prompt size
+            prompt_size = len(system_prompt) + len(user_prompt)
+            
+            # Warn if prompt is very large
+            if prompt_size > 100000:  # ~25k tokens
+                st.warning(f"⚠️ Large prompt detected ({prompt_size:,} chars). Consider reducing 'Top N Products' to avoid truncation.")
+            
+            if provider == "OpenAI":
+                with st.expander("Debug: Request Info", expanded=False):
+                    st.write(f"Model: {model_id}")
+                    st.write(f"Temperature: {temperature}")
+                    st.write(f"API URL: {api_url}")
+                    st.write(f"Prompt size: {prompt_size:,} chars (~{prompt_size//4:,} tokens)")
+            
             # Call LLM
             model_config = {
+                'provider': provider,
                 'api_url': api_url,
                 'api_key': api_key,
                 'model_id': model_id,
@@ -1846,17 +1989,78 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             analysis = parsed['analysis']
             
             # Create tabs for different insights
-            tabs = st.tabs(["📈 Trends", "🎯 Highlights", "⚠️ Risks", "✨ Positives", "📝 Narrative", "🔍 Raw Data"])
+            tabs = st.tabs(["📈 Trends", "🎯 Highlights", "⚠️ Risks", "✨ Positives", "❌ Negatives", "📝 Narrative", "🔍 Raw Data"])
             
             with tabs[0]:  # Trends
                 if 'brand_trends' in analysis and analysis['brand_trends']:
-                    st.markdown("##### Brand Trends")
+                    st.markdown("##### Key Market Trends")
                     for trend in analysis['brand_trends']:
-                        direction_icon = "📈" if trend.get('direction') == 'up' else "📉"
-                        st.write(f"{direction_icon} **{trend.get('theme', 'Unknown')}**: {trend.get('direction', 'Unknown')}")
+                        # Get direction and theme
+                        direction = trend.get('direction', 'Unknown')
+                        theme = trend.get('theme', 'Unknown trend')
+                        
+                        # Use appropriate icon based on whether it's positive or negative
+                        if 'improving' in direction.lower() or 'up' in direction.lower():
+                            if 'satisfaction' in theme.lower() or 'rating' in theme.lower():
+                                direction_icon = "📈"  # Good if satisfaction is up
+                            else:
+                                direction_icon = "⚠️"  # Bad if complaints/issues are up
+                        else:
+                            if 'satisfaction' in theme.lower() or 'rating' in theme.lower():
+                                direction_icon = "📉"  # Bad if satisfaction is down
+                            else:
+                                direction_icon = "✅"  # Good if complaints/issues are down
+                        
+                        st.write(f"{direction_icon} **{theme}**")
+                        
                         if 'evidence' in trend:
-                            for evidence in trend['evidence'][:3]:  # Show top 3 evidence points
-                                st.caption(f"  • {evidence.get('period', '')}: {evidence.get('metric', '')} = {evidence.get('value', '')}")
+                            # Group evidence by metric type for cleaner display
+                            for evidence in trend['evidence'][:3]:
+                                period = evidence.get('period', '')
+                                metric = evidence.get('metric', '')
+                                value = evidence.get('value', '')
+                                
+                                # Format the evidence in business-friendly way
+                                if period and metric and value:
+                                    # Convert all technical metric names to business language
+                                    if 'rating' in metric.lower() or 'customer_rating' in metric:
+                                        display = f"Customer rating: {value}"
+                                    elif 'negative_feedback' in metric or 'p_neg' in metric:
+                                        # Convert to percentage if needed
+                                        try:
+                                            if float(value) <= 1:  # Decimal format
+                                                pct = float(value) * 100
+                                                display = f"Customers with complaints: {pct:.0f}%"
+                                            else:  # Already percentage
+                                                display = f"Customers with complaints: {value}%"
+                                        except:
+                                            display = f"Negative feedback rate: {value}"
+                                    elif 'positive_feedback' in metric or 'p_pos' in metric:
+                                        try:
+                                            if float(value) <= 1:  # Decimal format
+                                                pct = float(value) * 100
+                                                display = f"Satisfied customers: {pct:.0f}%"
+                                            else:  # Already percentage
+                                                display = f"Satisfied customers: {value}%"
+                                        except:
+                                            display = f"Positive feedback rate: {value}"
+                                    elif 'sentiment' in metric.lower():
+                                        display = f"Customer sentiment: {value}"
+                                    elif 'n_reviews' in metric:
+                                        display = f"Number of reviews: {value}"
+                                    else:
+                                        # Clean up any remaining technical terms
+                                        clean_metric = metric.replace('_', ' ').replace('pct', 'percent').replace('avg', 'average')
+                                        display = f"{clean_metric.title()}: {value}"
+                                    
+                                    # Format date nicely
+                                    try:
+                                        from datetime import datetime
+                                        date_obj = datetime.strptime(period, '%Y-%m-%d')
+                                        formatted_date = date_obj.strftime('%B %d, %Y')
+                                        st.caption(f"  • {formatted_date}: {display}")
+                                    except:
+                                        st.caption(f"  • {period}: {display}")
                 else:
                     st.info("No significant brand trends detected")
                 
@@ -1871,15 +2075,25 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 # Check for both 'group_highlights' (new) and 'product_highlights' (old)
                 highlights = analysis.get('group_highlights', analysis.get('product_highlights', []))
                 if highlights:
-                    st.markdown("##### Highlights")
+                    st.markdown("##### Key Insights")
                     for highlight in highlights:
-                        z_score = highlight.get('z', 0)
-                        severity = "🔴" if abs(z_score) > 3 else "🟡" if abs(z_score) > 2 else "🟢"
                         # Handle both 'group' (new) and 'product' (old) fields
                         group_name = highlight.get('group', highlight.get('product', 'Unknown'))
+                        issue = highlight.get('issue', 'Unknown')
+                        change = highlight.get('change', highlight.get('delta_pct', 'N/A'))
+                        
+                        # Determine severity icon based on the description
+                        if any(word in issue.lower() for word in ['sharp', 'significant', 'major', 'critical']):
+                            severity = "🔴"
+                        elif any(word in issue.lower() for word in ['moderate', 'notable', 'concerning']):
+                            severity = "🟡"  
+                        else:
+                            severity = "🟢"
+                        
                         st.write(f"{severity} **{group_name}**")
-                        st.write(f"  Issue: {highlight.get('issue', 'Unknown')}")
-                        st.caption(f"  Z-score: {z_score:.2f} | Change: {highlight.get('delta_pct', 'N/A')}")
+                        st.write(f"  {issue}")
+                        if change and change != 'N/A':
+                            st.caption(f"  Change: {change}")
                 else:
                     st.info("No significant highlights detected")
             
@@ -1887,9 +2101,11 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 if 'risk_watchlist' in analysis and analysis['risk_watchlist']:
                     st.markdown("##### Risk Watchlist")
                     for risk in analysis['risk_watchlist']:
-                        st.write(f"⚠️ **{risk.get('product', 'Unknown')}**")
-                        st.write(f"  Reason: {risk.get('reason', 'Unknown')}")
-                        st.info(f"  💡 Action: {risk.get('action', 'No recommendation')}")
+                        # Handle both 'group' and 'product' fields
+                        item_name = risk.get('group', risk.get('product', 'Unknown'))
+                        st.write(f"⚠️ **{item_name}**")
+                        st.write(f"  Reason: {risk.get('reason', 'No reason provided')}")
+                        st.info(f"  💡 Action: {risk.get('action', 'Monitor closely')}")
                 else:
                     st.success("No significant risks detected")
             
@@ -1906,14 +2122,30 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 else:
                     st.info("No significant positive drivers detected")
             
-            with tabs[4]:  # Narrative
+            with tabs[4]:  # Negatives
+                if 'negative_patterns' in analysis and analysis['negative_patterns']:
+                    st.markdown("##### Negative Patterns")
+                    for pattern in analysis['negative_patterns']:
+                        st.write(f"❌ **{pattern.get('theme', 'Unknown issue')}**")
+                        # Handle both 'groups' and 'products' fields
+                        groups = pattern.get('groups', pattern.get('products', []))
+                        if groups:
+                            st.caption(f"  Affected groups: {', '.join(groups[:5])}")
+                        st.caption(f"  Evidence: {pattern.get('evidence', 'No evidence')}")
+                        if 'severity' in pattern:
+                            severity_color = "🔴" if pattern['severity'] == 'high' else "🟡" if pattern['severity'] == 'medium' else "🟢"
+                            st.caption(f"  Severity: {severity_color} {pattern['severity']}")
+                else:
+                    st.info("No significant negative patterns detected")
+            
+            with tabs[5]:  # Narrative
                 st.markdown("##### AI Narrative Summary")
                 if parsed['narrative']:
                     st.write(parsed['narrative'])
                 else:
                     st.info("No narrative provided")
             
-            with tabs[5]:  # Raw Data
+            with tabs[6]:  # Raw Data
                 st.markdown("##### Raw Analysis Data")
                 
                 # Show the metrics summary
@@ -1979,6 +2211,9 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             4. Try a smaller data set (reduce "Top N Products")
             5. Check the console/terminal for any error messages
             """)
+        
+        # Reset the flag after analysis is complete
+        st.session_state.ai_analysis_in_progress = False
     
     # Help section
     with st.expander("ℹ️ About AI Analysis"):
