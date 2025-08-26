@@ -1623,33 +1623,38 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     available_agg_columns = []
     column_display_names = {}
     
-    # Check for various aggregation columns (case-insensitive)
+    # Check for aggregation columns - looking for the actual column names from products.csv
     potential_columns = {
-        'Gender': 'Gender',
-        'Style_Code': 'Style Code', 
-        'Style': 'Style',
-        'Product_Sub_Class': 'Product Sub-Class',
-        'Product_Class': 'Product Class',
-        'Product_Category': 'Product Category',
-        'End_Use': 'End Use',
+        'GENDER_TEXT': 'Gender',
+        'GENDER_CODE': 'Gender Code',
+        'STYLE_CODE': 'Style Code',
+        'STYLE_TEXT': 'Style', 
+        'PRODUCT_SUB_CLASS_TEXT': 'Product Sub-Class',
+        'PRODUCT_SUB_CLASS_CODE': 'Product Sub-Class Code',
+        'PRODUCT_CLASS_TEXT': 'Product Class',
+        'PRODUCT_CLASS_CODE': 'Product Class Code',
+        'END_USE_TEXT': 'End Use',
         'END_USE_CODE': 'End Use Code',
-        'Brand': 'Brand',
-        'Collection': 'Collection',
-        'Season': 'Season'
+        'BRAND_TEXT': 'Brand',
+        'COLLECTION_TEXT': 'Collection',
+        'SEASON_TEXT': 'Season'
     }
     
-    for col_pattern, display_name in potential_columns.items():
-        # Case-insensitive column matching
-        matching_cols = [c for c in df.columns if c.upper() == col_pattern.upper().replace('_', '')]
-        if not matching_cols:
-            matching_cols = [c for c in df.columns if c.upper() == col_pattern.upper()]
-        if matching_cols:
-            available_agg_columns.append(matching_cols[0])
-            column_display_names[matching_cols[0]] = display_name
+    # Check which columns actually exist in the dataframe
+    for col_name, display_name in potential_columns.items():
+        if col_name in df.columns:
+            # Only add if column has valid data
+            if df[col_name].notna().any():
+                available_agg_columns.append(col_name)
+                column_display_names[col_name] = display_name
     
     # Always include product-level as an option
     available_agg_columns.append('product')
     column_display_names['product'] = 'Individual Product'
+    
+    # Debug: Show what columns were found
+    if len(available_agg_columns) <= 2:  # Only product and one other
+        st.warning(f"Limited aggregation options found. Available columns in data: {', '.join([c for c in df.columns if 'TEXT' in c or 'CODE' in c][:10])}")
     
     # Configuration section
     with st.expander("⚙️ AI Analysis Configuration", expanded=False):
@@ -2038,10 +2043,26 @@ def main():
         products_df['PRODUCT_SKU_TEXT_UPPER'] = products_df['PRODUCT_SKU_TEXT'].str.upper()
         df['product_upper'] = df['product'].str.upper()
         
-        # Merge with product data - including SIZE_CODE and STYLE_CODE_AND_TEXT
+        # Merge with product data - including both CODE and TEXT columns for aggregation
+        merge_columns = ['PRODUCT_SKU_TEXT_UPPER']
+        
+        # Add CODE columns for filtering
+        code_columns = ['GENDER_CODE', 'PRODUCT_CLASS_CODE', 'PRODUCT_SUB_CLASS_CODE', 
+                       'END_USE_CODE', 'SIZE_CODE', 'STYLE_CODE']
+        
+        # Add TEXT columns for aggregation and display
+        text_columns = ['GENDER_TEXT', 'PRODUCT_CLASS_TEXT', 'PRODUCT_SUB_CLASS_TEXT', 
+                       'END_USE_TEXT', 'BRAND_TEXT', 'COLLECTION_TEXT', 'SEASON_TEXT',
+                       'STYLE_CODE_AND_TEXT', 'STYLE_TEXT']
+        
+        # Only include columns that exist in the products_df
+        available_columns = merge_columns.copy()
+        for col in code_columns + text_columns:
+            if col in products_df.columns:
+                available_columns.append(col)
+        
         df = df.merge(
-            products_df[['PRODUCT_SKU_TEXT_UPPER', 'GENDER_CODE', 'PRODUCT_CLASS_CODE', 
-                        'PRODUCT_SUB_CLASS_CODE', 'END_USE_CODE', 'SIZE_CODE', 'STYLE_CODE_AND_TEXT']],
+            products_df[available_columns],
             left_on='product_upper',
             right_on='PRODUCT_SKU_TEXT_UPPER',
             how='left'
