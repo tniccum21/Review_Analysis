@@ -645,6 +645,16 @@ def model_configuration_sidebar():
             st.error("❌ Backend unavailable. Check process_reviews.py")
             return
         
+        # Get defaults from environment variables (ANALYZE-specific, with fallback to generic)
+        default_model = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
+        default_temperature = float(os.getenv("ANALYZE_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
+        
+        # Initialize model_config with defaults if not already set
+        if 'model_id' not in st.session_state.model_config:
+            st.session_state.model_config['model_id'] = default_model
+        if 'temperature' not in st.session_state.model_config:
+            st.session_state.model_config['temperature'] = default_temperature
+        
         st.info("Ensure your LLM host (e.g., LM Studio) is running on port 1234")
         
         available_models = fetch_available_models()
@@ -652,7 +662,7 @@ def model_configuration_sidebar():
         if available_models:
             st.success(f"✅ Connected ({len(available_models)} models)")
             
-            current_model = st.session_state.model_config.get('model_id')
+            current_model = st.session_state.model_config.get('model_id', default_model)
             if current_model not in available_models and available_models:
                 current_model = available_models[0]
                 st.session_state.model_config['model_id'] = current_model
@@ -665,21 +675,23 @@ def model_configuration_sidebar():
             st.session_state.model_config['model_id'] = st.selectbox(
                 "Select Model",
                 options=available_models,
-                index=current_index
+                index=current_index,
+                help="Set ANALYZE_LLM_MODEL_ID env var to change default"
             )
         else:
             st.warning("⚠️ No connection. Enter manually:")
             st.session_state.model_config['model_id'] = st.text_input(
                 "Model ID",
-                value=st.session_state.model_config.get('model_id', 'gemma-2-9b-it')
+                value=st.session_state.model_config.get('model_id', default_model),
+                help="Set ANALYZE_LLM_MODEL_ID env var to change default"
             )
         
         st.session_state.model_config['temperature'] = st.slider(
             "Temperature",
             0.0, 1.0,
-            st.session_state.model_config.get('temperature', 0.0),
+            st.session_state.model_config.get('temperature', default_temperature),
             0.01,
-            help="0.0 for deterministic, consistent results"
+            help="Set ANALYZE_LLM_TEMPERATURE env var to change default (0.0 for deterministic, consistent results)"
         )
         
         if st.button("🔄 Refresh Connection"):

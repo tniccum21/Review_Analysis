@@ -1219,7 +1219,7 @@ def fetch_available_models():
         pass
     return []
 
-def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str, Any]:
+def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week', aggregation_level: str = 'product') -> Dict[str, Any]:
     """Compute aggregated metrics for AI analysis"""
     
     # Convert date to datetime and create period column
@@ -1230,6 +1230,17 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
         df['period'] = df['date'].dt.to_period('W').dt.start_time
     else:  # month
         df['period'] = df['date'].dt.to_period('M').dt.start_time
+    
+    # Determine the aggregation column
+    if aggregation_level != 'product':
+        # Use the specified aggregation level
+        agg_column = aggregation_level
+        # Check if column exists
+        if agg_column not in df.columns:
+            return {'error': f"Aggregation column '{agg_column}' not found in data"}
+    else:
+        # Use product column
+        agg_column = 'product'
     
     # Filter out rows with invalid dates
     df = df.dropna(subset=['date', 'period'])
@@ -1242,9 +1253,9 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
     df['is_negative'] = df['sentiment'] == 'Negative'
     df['is_neutral'] = df['sentiment'] == 'Neutral'
     
-    # Group by period and product
-    group_cols = ['period', 'product']
-    if 'product_description' in df.columns:
+    # Group by period and aggregation level
+    group_cols = ['period', agg_column]
+    if aggregation_level == 'product' and 'product_description' in df.columns:
         group_cols.append('product_description')
     
     # Basic aggregations
@@ -1257,14 +1268,14 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
     }
     
     agg_df = df.groupby(group_cols).agg(agg_dict).reset_index()
-    agg_df.columns = ['period', 'product'] + (['product_description'] if 'product_description' in group_cols else []) + \
+    agg_df.columns = ['period', 'group_key'] + (['product_description'] if 'product_description' in group_cols else []) + \
                       ['n_reviews', 'avg_rating', 'p_pos', 'p_neg', 'p_neu']
     
     # Process problem and positive mentions
     problem_counts = []
     positive_counts = []
     
-    for (period, product), group in df.groupby(['period', 'product']):
+    for (period, group_key), group in df.groupby(['period', agg_column]):
         # Count problems
         problems = {}
         for prob_str in group['problems_mentioned'].dropna():
@@ -1283,28 +1294,28 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
                     if p and p != 'None':
                         positives[p] = positives.get(p, 0) + 1
         
-        problem_counts.append({'period': period, 'product': product, 'problem_counts': problems})
-        positive_counts.append({'period': period, 'product': product, 'positive_counts': positives})
+        problem_counts.append({'period': period, 'group_key': group_key, 'problem_counts': problems})
+        positive_counts.append({'period': period, 'group_key': group_key, 'positive_counts': positives})
     
     # Merge problem and positive counts
     problem_df = pd.DataFrame(problem_counts)
     positive_df = pd.DataFrame(positive_counts)
     
-    agg_df = agg_df.merge(problem_df, on=['period', 'product'], how='left')
-    agg_df = agg_df.merge(positive_df, on=['period', 'product'], how='left')
+    agg_df = agg_df.merge(problem_df, on=['period', 'group_key'], how='left')
+    agg_df = agg_df.merge(positive_df, on=['period', 'group_key'], how='left')
     
     # Fill missing counts with empty dicts
     agg_df['problem_counts'] = agg_df['problem_counts'].fillna({}).apply(lambda x: x if x else {})
     agg_df['positive_counts'] = agg_df['positive_counts'].fillna({}).apply(lambda x: x if x else {})
     
     # Calculate rolling baselines and z-scores
-    agg_df = agg_df.sort_values(['product', 'period'])
+    agg_df = agg_df.sort_values(['group_key', 'period'])
     
     # Rolling statistics for negative sentiment
-    agg_df['neg_roll_mean'] = agg_df.groupby('product')['p_neg'].transform(
+    agg_df['neg_roll_mean'] = agg_df.groupby('group_key')['p_neg'].transform(
         lambda s: s.rolling(8, min_periods=4, center=False).mean()
     )
-    agg_df['neg_roll_std'] = agg_df.groupby('product')['p_neg'].transform(
+    agg_df['neg_roll_std'] = agg_df.groupby('group_key')['p_neg'].transform(
         lambda s: s.rolling(8, min_periods=4, center=False).std()
     )
     
@@ -1317,10 +1328,10 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
     )
     
     # Calculate deltas vs baseline
-    agg_df['rating_delta'] = agg_df.groupby('product')['avg_rating'].transform(
+    agg_df['rating_delta'] = agg_df.groupby('group_key')['avg_rating'].transform(
         lambda s: s - s.rolling(8, min_periods=4, center=False).mean()
     )
-    agg_df['neg_delta_pct'] = agg_df.groupby('product')['p_neg'].transform(
+    agg_df['neg_delta_pct'] = agg_df.groupby('group_key')['p_neg'].transform(
         lambda s: ((s / s.rolling(8, min_periods=4, center=False).mean()) - 1) * 100
     )
     
@@ -1333,26 +1344,28 @@ def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str,
     return {
         'aggregated_data': agg_df,
         'granularity': granularity,
+        'aggregation_level': aggregation_level,
         'total_reviews': len(df),
-        'products_analyzed': df['product'].nunique(),
+        'groups_analyzed': df[agg_column].nunique(),
         'date_range': f"{df['date'].min().strftime('%Y-%m-%d')} to {df['date'].max().strftime('%Y-%m-%d')}"
     }
 
-def prepare_llm_payload(metrics: Dict[str, Any], top_n_products: int = 20) -> Dict[str, Any]:
+def prepare_llm_payload(metrics: Dict[str, Any], top_n_groups: int = 20) -> Dict[str, Any]:
     """Prepare the compact JSON payload for LLM analysis"""
     
     agg_df = metrics['aggregated_data']
+    aggregation_level = metrics.get('aggregation_level', 'product')
     
-    # Get top products by review volume
-    top_products = (
-        agg_df.groupby('product')['n_reviews']
+    # Get top groups by review volume
+    top_groups = (
+        agg_df.groupby('group_key')['n_reviews']
         .sum()
-        .nlargest(top_n_products)
+        .nlargest(top_n_groups)
         .index.tolist()
     )
     
-    # Filter to top products and recent periods
-    recent_df = agg_df[agg_df['product'].isin(top_products)].copy()
+    # Filter to top groups and recent periods
+    recent_df = agg_df[agg_df['group_key'].isin(top_groups)].copy()
     recent_df = recent_df.sort_values('period').tail(200)  # Last 200 data points
     
     # Build series data for JSON
@@ -1360,7 +1373,7 @@ def prepare_llm_payload(metrics: Dict[str, Any], top_n_products: int = 20) -> Di
     for _, row in recent_df.iterrows():
         series_item = {
             'period': row['period'].strftime('%Y-%m-%d'),
-            'product': row['product'],
+            'group': row['group_key'],
             'n_reviews': int(row['n_reviews']),
             'avg_rating': round(float(row['avg_rating']), 2) if pd.notna(row['avg_rating']) else None,
             'p_pos': round(float(row['p_pos']), 3) if pd.notna(row['p_pos']) else 0,
@@ -1385,11 +1398,12 @@ def prepare_llm_payload(metrics: Dict[str, Any], top_n_products: int = 20) -> Di
             'analysis_date': datetime.now().strftime('%Y-%m-%d'),
             'period': metrics.get('date_range', 'Unknown'),
             'granularity': metrics.get('granularity', 'week'),
+            'aggregation_level': aggregation_level,
             'total_reviews': metrics.get('total_reviews', 0),
-            'products_analyzed': len(top_products),
+            'groups_analyzed': len(top_groups),
             'anomaly_rules': {
                 'z_abs_threshold': 2.0,
-                'min_count': 15
+                'min_count': 10  # Lowered threshold for aggregated data
             }
         },
         'series': series
@@ -1404,13 +1418,16 @@ def create_ai_analysis_prompt(payload: Dict[str, Any]) -> tuple[str, str]:
 Prioritize statistically meaningful change. Avoid vague claims.
 When you cite a reason, name the metric(s) and the period(s) that moved."""
     
+    aggregation_level = payload.get('meta', {}).get('aggregation_level', 'product')
+    min_count = payload.get('meta', {}).get('anomaly_rules', {}).get('min_count', 10)
+    
     user_prompt = f"""Goal: Find trends over time, surface anomalies, and explain likely drivers with supporting slices.
 
 Data: {json.dumps(payload, indent=2)}
 
 Rules:
-- Treat each row as period×product summary.
-- An anomaly requires min_count >= 15 AND |z| >= 2.0.
+- Treat each row as period×{aggregation_level} summary.
+- An anomaly requires min_count >= {min_count} AND |z| >= 2.0.
 - Prefer changes that persist >=2 periods.
 - Map problems/positives into themes if obvious.
 - If data are insufficient, say so explicitly.
@@ -1421,17 +1438,17 @@ Output a structured JSON analysis followed by a brief narrative (8-12 lines):
   "brand_trends": [
     {{"theme":"<theme>","direction":"up/down","evidence":[{{"period":"YYYY-MM-DD","metric":"<metric>","value":<value>}}]}}
   ],
-  "product_highlights": [
-    {{"product":"<product>", "issue":"<description>", "metric":"<metric>", "z":<z-score>, "delta_pct":"<change>", "periods":["YYYY-MM-DD"]}}
+  "group_highlights": [
+    {{"group":"<{aggregation_level}>", "issue":"<description>", "metric":"<metric>", "z":<z-score>, "delta_pct":"<change>", "periods":["YYYY-MM-DD"]}}
   ],
   "emerging_topics": [
-    {{"label":"<topic>","products":["<product>"],"trend":"<description>","support_trend":[<counts>]}}
+    {{"label":"<topic>","groups":["<{aggregation_level}>"],"trend":"<description>","support_trend":[<counts>]}}
   ],
   "risk_watchlist": [
-    {{"product":"<product>", "reason":"<explanation>", "action":"<recommendation>"}}
+    {{"group":"<{aggregation_level}>", "reason":"<explanation>", "action":"<recommendation>"}}
   ],
   "positive_drivers": [
-    {{"theme":"<theme>","products":["<product>"],"evidence":"<description>"}}
+    {{"theme":"<theme>","groups":["<{aggregation_level}>"],"evidence":"<description>"}}
   ]
 }}
 
@@ -1481,31 +1498,117 @@ def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, s
     except (KeyError, IndexError) as e:
         return f"Error parsing LLM response: {str(e)}"
 
+def _extract_json_from_text(text: str) -> Optional[str]:
+    """
+    Finds and extracts the first JSON object string from a text block.
+    This is the same robust helper used in process_reviews.py
+    """
+    try:
+        # Find the first opening curly brace
+        start_index = text.find('{')
+        if start_index == -1:
+            return None
+        
+        # Find the last closing curly brace
+        end_index = text.rfind('}')
+        if end_index == -1 or end_index < start_index:
+            return None
+        
+        # Return the substring that looks like a JSON object
+        return text[start_index:end_index + 1]
+    except Exception:
+        return None
+
 def parse_llm_response(response: str) -> Dict[str, Any]:
     """Parse the LLM response to extract JSON and narrative"""
     
-    # Try to find JSON block in the response
-    json_start = response.find('{')
-    json_end = response.rfind('}')
+    # Handle error responses
+    if response.startswith("Error") or response.startswith("Failed") or response.startswith("LLM API"):
+        return {
+            'success': False,
+            'error': True,
+            'analysis': {},
+            'narrative': response,
+            'raw_response': response
+        }
     
-    if json_start != -1 and json_end != -1:
-        json_str = response[json_start:json_end + 1]
+    # Try multiple methods to extract JSON
+    json_str = None
+    narrative = ""
+    
+    # Method 1: Look for ```json code blocks
+    if '```json' in response.lower():
+        start = response.lower().find('```json') + 7
+        end = response.find('```', start)
+        if end > start:
+            json_str = response[start:end].strip()
+            narrative = response[end+3:].strip()
+    
+    # Method 2: Look for ``` code blocks (without json marker)
+    if not json_str and '```' in response:
+        parts = response.split('```')
+        for i, part in enumerate(parts):
+            if i % 2 == 1:  # Odd indices are code blocks
+                test_str = part.strip()
+                if test_str.startswith('{'):
+                    json_str = test_str
+                    # Get narrative from remaining parts
+                    narrative = ''.join(parts[i+1:]).strip()
+                    break
+    
+    # Method 3: Use the robust helper function
+    if not json_str:
+        json_str = _extract_json_from_text(response)
+        if json_str:
+            # Find narrative after the JSON
+            json_end = response.rfind('}')
+            if json_end != -1:
+                narrative = response[json_end + 1:].strip()
+    
+    # Try to parse the JSON
+    if json_str:
         try:
+            # Clean up common issues
+            json_str = json_str.strip()
+            # Remove any markdown formatting
+            if json_str.startswith('`'):
+                json_str = json_str.strip('`')
+            if json_str.startswith('json'):
+                json_str = json_str[4:].strip()
+            
+            # Parse the JSON
             analysis_json = json.loads(json_str)
-            # Extract narrative (everything after the JSON)
-            narrative = response[json_end + 1:].strip()
+            
+            # Extract narrative if not already found
+            if not narrative:
+                # Look for narrative after JSON in original response
+                json_in_response = response.find(json_str)
+                if json_in_response != -1:
+                    narrative = response[json_in_response + len(json_str):].strip()
+            
             return {
                 'success': True,
                 'analysis': analysis_json,
                 'narrative': narrative,
-                'raw_response': response
+                'raw_response': response,
+                'extracted_json': json_str  # For debugging
             }
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            return {
+                'success': False,
+                'error': True,
+                'parse_error': str(e),
+                'analysis': {},
+                'narrative': response,
+                'raw_response': response,
+                'attempted_json': json_str  # For debugging
+            }
     
-    # Fallback if JSON parsing fails
+    # Fallback if no JSON found
     return {
         'success': False,
+        'error': False,
+        'no_json_found': True,
         'analysis': {},
         'narrative': response,
         'raw_response': response
@@ -1516,11 +1619,52 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     
     st.markdown("#### 🤖 AI-Powered Analysis")
     
+    # Identify available aggregation columns
+    available_agg_columns = []
+    column_display_names = {}
+    
+    # Check for various aggregation columns (case-insensitive)
+    potential_columns = {
+        'Gender': 'Gender',
+        'Style_Code': 'Style Code', 
+        'Style': 'Style',
+        'Product_Sub_Class': 'Product Sub-Class',
+        'Product_Class': 'Product Class',
+        'Product_Category': 'Product Category',
+        'End_Use': 'End Use',
+        'END_USE_CODE': 'End Use Code',
+        'Brand': 'Brand',
+        'Collection': 'Collection',
+        'Season': 'Season'
+    }
+    
+    for col_pattern, display_name in potential_columns.items():
+        # Case-insensitive column matching
+        matching_cols = [c for c in df.columns if c.upper() == col_pattern.upper().replace('_', '')]
+        if not matching_cols:
+            matching_cols = [c for c in df.columns if c.upper() == col_pattern.upper()]
+        if matching_cols:
+            available_agg_columns.append(matching_cols[0])
+            column_display_names[matching_cols[0]] = display_name
+    
+    # Always include product-level as an option
+    available_agg_columns.append('product')
+    column_display_names['product'] = 'Individual Product'
+    
     # Configuration section
     with st.expander("⚙️ AI Analysis Configuration", expanded=False):
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
+            # Aggregation level selector
+            aggregation_level = st.selectbox(
+                "Aggregation Level:",
+                available_agg_columns,
+                format_func=lambda x: column_display_names.get(x, x),
+                index=0 if available_agg_columns else None,
+                help="Choose how to group products for analysis"
+            )
+            
             granularity = st.selectbox(
                 "Time Granularity:",
                 ["week", "month"],
@@ -1530,60 +1674,82 @@ def create_ai_analysis_tab(df: pd.DataFrame):
         
         with col2:
             top_n = st.slider(
-                "Top N Products:",
+                f"Top N {column_display_names.get(aggregation_level, 'Groups')}:",
                 min_value=5,
                 max_value=50,
                 value=20,
                 step=5,
-                help="Number of top products to analyze"
+                help=f"Number of top {column_display_names.get(aggregation_level, 'groups').lower()} to analyze"
             )
-        
-        with col3:
+            
             min_reviews = st.number_input(
                 "Min Reviews per Period:",
-                min_value=5,
+                min_value=3,
                 max_value=100,
                 value=15,
                 step=5,
                 help="Minimum reviews required for statistical significance"
             )
     
-    # LLM Configuration
+    # LLM Configuration with Environment Variable Defaults
     st.markdown("##### 🔧 LLM Configuration")
+    
+    # Get defaults from environment variables (AI-specific, with fallback to generic)
+    default_provider = os.getenv("AI_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "LM Studio (Local)"))
+    default_api_url = os.getenv("AI_LLM_API_URL", os.getenv("LLM_API_URL", ""))
+    default_api_key = os.getenv("AI_LLM_API_KEY", os.getenv("LLM_API_KEY", ""))
+    default_model = os.getenv("AI_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
+    default_temperature = float(os.getenv("AI_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.1")))
+    
+    # If LM_STUDIO_HOST is set but not LLM_API_URL, use it as default
+    if not default_api_url and os.getenv("LM_STUDIO_HOST"):
+        default_api_url = f"{os.getenv('LM_STUDIO_HOST')}/v1/chat/completions"
+    
     col1, col2 = st.columns(2)
     
     with col1:
+        # Provider selection
+        provider_options = ["LM Studio (Local)", "OpenAI", "Custom API"]
+        provider_index = 0
+        if default_provider in provider_options:
+            provider_index = provider_options.index(default_provider)
+        
         provider = st.selectbox(
             "LLM Provider:",
-            ["LM Studio (Local)", "OpenAI", "Custom API", "Mock (Testing)"],
-            index=0
+            provider_options,
+            index=provider_index,
+            help="Set AI_LLM_PROVIDER env var to change default"
         )
         
         if provider == "LM Studio (Local)":
-            # Use environment variable with same default as analyze app
+            # Use environment variable with fallback
             base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+            default_url = default_api_url or f"{base_url}/v1/chat/completions"
             api_url = st.text_input(
                 "API URL:",
-                value=f"{base_url}/v1/chat/completions",
-                help="Local LM Studio endpoint - make sure LM Studio is running!"
+                value=default_url,
+                help="Set AI_LLM_API_URL or LM_STUDIO_HOST env var to change default"
             )
-            api_key = "not-needed"
+            api_key = default_api_key or "not-needed"
         elif provider == "OpenAI":
-            api_url = "https://api.openai.com/v1/chat/completions"
+            api_url = default_api_url or "https://api.openai.com/v1/chat/completions"
             api_key = st.text_input(
                 "API Key:",
+                value=default_api_key,
                 type="password",
-                help="Your OpenAI API key"
+                help="Set AI_LLM_API_KEY env var to avoid entering each time"
             )
         else:
             api_url = st.text_input(
                 "API URL:",
-                help="Your custom API endpoint"
+                value=default_api_url,
+                help="Set AI_LLM_API_URL env var to change default"
             )
             api_key = st.text_input(
                 "API Key:",
+                value=default_api_key,
                 type="password",
-                help="API key if required"
+                help="Set AI_LLM_API_KEY env var to avoid entering each time"
             )
     
     with col2:
@@ -1593,32 +1759,46 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             available_models = fetch_available_models()
         
         if available_models:
+            # Try to find default model in available models
+            model_index = 0
+            if default_model in available_models:
+                model_index = available_models.index(default_model)
+            
             model_id = st.selectbox(
                 "Model:",
                 available_models,
-                index=0
+                index=model_index,
+                help="Set AI_LLM_MODEL_ID env var to change default"
             )
         else:
+            # Use environment variable or provider-specific default
+            if default_model:
+                model_value = default_model
+            elif provider == "LM Studio (Local)":
+                model_value = "gemma-2-9b-it"
+            else:
+                model_value = "gpt-4"
+            
             model_id = st.text_input(
                 "Model ID:",
-                value="gemma-2-9b-it" if provider == "LM Studio (Local)" else "gpt-4",
-                help="Model identifier"
+                value=model_value,
+                help="Set AI_LLM_MODEL_ID env var to change default"
             )
         
         temperature = st.slider(
             "Temperature:",
             min_value=0.0,
             max_value=1.0,
-            value=0.1,
+            value=default_temperature,
             step=0.05,
-            help="Lower = more focused, Higher = more creative"
+            help="Set AI_LLM_TEMPERATURE env var to change default (Lower = more focused, Higher = more creative)"
         )
     
     # Analysis button and results
     if st.button("🚀 Generate AI Analysis", type="primary"):
         with st.spinner("Computing metrics..."):
             # Compute metrics
-            metrics = compute_ai_metrics(df, granularity)
+            metrics = compute_ai_metrics(df, granularity, aggregation_level)
             
             if 'error' in metrics:
                 st.error(metrics['error'])
@@ -1709,8 +1889,10 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                     st.markdown("##### Positive Drivers")
                     for driver in analysis['positive_drivers']:
                         st.write(f"✅ **{driver.get('theme', 'Unknown')}**")
-                        if 'products' in driver:
-                            st.caption(f"  Products: {', '.join(driver['products'][:5])}")
+                        # Handle both 'groups' and 'products' fields
+                        groups = driver.get('groups', driver.get('products', []))
+                        if groups:
+                            st.caption(f"  Groups: {', '.join(groups[:5])}")
                         st.caption(f"  Evidence: {driver.get('evidence', 'No evidence')}")
                 else:
                     st.info("No significant positive drivers detected")
@@ -1730,7 +1912,7 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 with col1:
                     st.metric("Total Reviews", f"{metrics['total_reviews']:,}")
                 with col2:
-                    st.metric("Products Analyzed", metrics['products_analyzed'])
+                    st.metric("Groups Analyzed", metrics.get('groups_analyzed', metrics.get('products_analyzed', 0)))
                 with col3:
                     st.metric("Date Range", metrics['date_range'])
                 
@@ -1746,8 +1928,32 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                     )
         else:
             st.warning("⚠️ Could not parse structured analysis from LLM response")
-            st.markdown("##### Raw Response:")
-            st.text_area("", value=parsed['raw_response'], height=400)
+            
+            # Show debugging information
+            if 'error' in parsed and parsed['error']:
+                st.error(f"**Error Type**: {parsed.get('narrative', 'Unknown error')}")
+                
+                if 'parse_error' in parsed:
+                    st.error(f"**JSON Parse Error**: {parsed['parse_error']}")
+                
+                if 'attempted_json' in parsed:
+                    st.markdown("##### Attempted to parse this JSON:")
+                    st.code(parsed['attempted_json'], language='json')
+            
+            # Show raw response for debugging
+            st.markdown("##### Raw LLM Response:")
+            with st.expander("View Full Response", expanded=True):
+                st.text_area("", value=parsed['raw_response'], height=400)
+            
+            # Helpful tips
+            st.info("""
+            **Troubleshooting Tips:**
+            1. Check if LM Studio is running and the model is loaded
+            2. Try increasing the temperature slightly (0.1-0.3)
+            3. Ensure the model supports JSON output (Gemma, Llama, Mistral usually work well)
+            4. Try a smaller data set (reduce "Top N Products")
+            5. Check the console/terminal for any error messages
+            """)
     
     # Help section
     with st.expander("ℹ️ About AI Analysis"):
