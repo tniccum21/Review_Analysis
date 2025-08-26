@@ -1206,6 +1206,19 @@ def create_wordcloud_visualization(df: pd.DataFrame):
     except Exception as e:
         st.error(f"Error generating word cloud: {e}")
 
+def fetch_available_models():
+    """Fetch available models from LM Studio - consistent with analyze app"""
+    lm_studio_host = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+    try:
+        response = requests.get(f"{lm_studio_host}/v1/models", timeout=3)
+        if response.status_code == 200:
+            models_data = response.json()
+            if 'data' in models_data:
+                return [model['id'] for model in models_data['data']]
+    except requests.exceptions.RequestException:
+        pass
+    return []
+
 def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week') -> Dict[str, Any]:
     """Compute aggregated metrics for AI analysis"""
     
@@ -1427,18 +1440,24 @@ Then add a narrative that tells the story in plain English."""
     return system_prompt, user_prompt
 
 def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, str]) -> str:
-    """Call the LLM API (LM Studio or other providers)"""
+    """Call the LLM API (LM Studio or other providers) - using same pattern as analyze app"""
     
-    # Default to LM Studio endpoint
-    api_url = model_config.get('api_url', 'http://localhost:1234/v1/chat/completions')
+    # Use environment variable with same default as analyze app
+    base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+    
+    # Get API URL based on provider or use base URL
+    api_url = model_config.get('api_url', f'{base_url}/v1/chat/completions')
     api_key = model_config.get('api_key', 'not-needed')  # LM Studio doesn't need a real key
     model_id = model_config.get('model_id', 'gemma-2-9b-it')
     temperature = float(model_config.get('temperature', 0.1))
     
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}'
     }
+    
+    # Only add Authorization header if API key is provided and not 'not-needed'
+    if api_key and api_key != 'not-needed':
+        headers['Authorization'] = f'Bearer {api_key}'
     
     data = {
         'model': model_id,
@@ -1451,12 +1470,14 @@ def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, s
     }
     
     try:
-        response = requests.post(api_url, headers=headers, json=data, timeout=60)
+        response = requests.post(api_url, headers=headers, json=data, timeout=300)  # 5 minutes for large models
         response.raise_for_status()
         result = response.json()
         return result['choices'][0]['message']['content']
+    except requests.exceptions.HTTPError as e:
+        return f"LLM API request failed: {str(e)}"
     except requests.exceptions.RequestException as e:
-        return f"Error calling LLM API: {str(e)}"
+        return f"Failed to connect to LLM provider: {str(e)}"
     except (KeyError, IndexError) as e:
         return f"Error parsing LLM response: {str(e)}"
 
@@ -1534,15 +1555,17 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     with col1:
         provider = st.selectbox(
             "LLM Provider:",
-            ["LM Studio (Local)", "OpenAI", "Custom API"],
+            ["LM Studio (Local)", "OpenAI", "Custom API", "Mock (Testing)"],
             index=0
         )
         
         if provider == "LM Studio (Local)":
+            # Use environment variable with same default as analyze app
+            base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
             api_url = st.text_input(
                 "API URL:",
-                value="http://localhost:1234/v1/chat/completions",
-                help="Local LM Studio endpoint"
+                value=f"{base_url}/v1/chat/completions",
+                help="Local LM Studio endpoint - make sure LM Studio is running!"
             )
             api_key = "not-needed"
         elif provider == "OpenAI":
@@ -1564,20 +1587,10 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             )
     
     with col2:
-        # Try to fetch available models
+        # Try to fetch available models using the same function as analyze app
         available_models = []
         if provider == "LM Studio (Local)":
-            try:
-                models_response = requests.get(
-                    api_url.replace('/v1/chat/completions', '/v1/models'),
-                    timeout=3
-                )
-                if models_response.status_code == 200:
-                    models_data = models_response.json()
-                    if 'data' in models_data:
-                        available_models = [m['id'] for m in models_data['data']]
-            except:
-                pass
+            available_models = fetch_available_models()
         
         if available_models:
             model_id = st.selectbox(
