@@ -1416,23 +1416,22 @@ def create_ai_analysis_prompt(payload: Dict[str, Any]) -> tuple[str, str]:
     
     system_prompt = """You are a senior retail analytics copilot. You ONLY use facts in the provided JSON.
 Prioritize statistically meaningful change. Avoid vague claims.
-When you cite a reason, name the metric(s) and the period(s) that moved."""
+Output ONLY the requested JSON structure followed by a brief narrative. DO NOT include reasoning or explanations before the JSON."""
     
     aggregation_level = payload.get('meta', {}).get('aggregation_level', 'product')
     min_count = payload.get('meta', {}).get('anomaly_rules', {}).get('min_count', 10)
     
-    user_prompt = f"""Goal: Find trends over time, surface anomalies, and explain likely drivers with supporting slices.
+    user_prompt = f"""Goal: Find trends over time, surface anomalies, and explain likely drivers.
 
 Data: {json.dumps(payload, indent=2)}
 
 Rules:
-- Treat each row as period×{aggregation_level} summary.
-- An anomaly requires min_count >= {min_count} AND |z| >= 2.0.
-- Prefer changes that persist >=2 periods.
-- Map problems/positives into themes if obvious.
-- If data are insufficient, say so explicitly.
+- Each row is period×{aggregation_level} summary
+- Anomaly = min_count >= {min_count} AND |z| >= 2.0
+- Focus on changes persisting >=2 periods
+- If insufficient data, state in narrative
 
-Output a structured JSON analysis followed by a brief narrative (8-12 lines):
+IMPORTANT: Output ONLY the JSON below (no reasoning), then a brief 8-line narrative:
 
 {{
   "brand_trends": [
@@ -1483,7 +1482,7 @@ def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, s
             {'role': 'user', 'content': user_prompt}
         ],
         'temperature': temperature,
-        'max_tokens': 2000
+        'max_tokens': 4000  # Increased to ensure JSON completion
     }
     
     try:
@@ -1529,6 +1528,19 @@ def parse_llm_response(response: str) -> Dict[str, Any]:
             'error': True,
             'analysis': {},
             'narrative': response,
+            'raw_response': response
+        }
+    
+    # Check if response looks truncated (no closing brace at end)
+    response_stripped = response.strip()
+    if response_stripped and not (response_stripped.endswith('}') or response_stripped.endswith('.')):
+        # Response may be truncated
+        return {
+            'success': False,
+            'error': True,
+            'message': 'Response appears truncated. Increase max_tokens or reduce data size.',
+            'analysis': {},
+            'narrative': 'LLM response was cut off before completing the analysis.',
             'raw_response': response
         }
     
@@ -1924,7 +1936,10 @@ def create_ai_analysis_tab(df: pd.DataFrame):
             
             # Show debugging information
             if 'error' in parsed and parsed['error']:
-                st.error(f"**Error Type**: {parsed.get('narrative', 'Unknown error')}")
+                if 'message' in parsed:
+                    st.error(f"**Issue**: {parsed['message']}")
+                else:
+                    st.error(f"**Error Type**: {parsed.get('narrative', 'Unknown error')}")
                 
                 if 'parse_error' in parsed:
                     st.error(f"**JSON Parse Error**: {parsed['parse_error']}")
@@ -1933,9 +1948,22 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                     st.markdown("##### Attempted to parse this JSON:")
                     st.code(parsed['attempted_json'], language='json')
             
+            # Show response analysis
+            raw_resp = parsed.get('raw_response', '')
+            if raw_resp:
+                st.caption(f"📊 Response size: {len(raw_resp)} characters")
+                
+                # Check for common issues
+                if len(raw_resp) < 100:
+                    st.warning("Response is very short. Check if the LLM is working correctly.")
+                elif not ('{' in raw_resp and '}' in raw_resp):
+                    st.warning("Response doesn't appear to contain JSON. The model may not understand the prompt.")
+                elif raw_resp.count('{') != raw_resp.count('}'):
+                    st.warning("JSON appears incomplete (mismatched braces). Try increasing max_tokens.")
+            
             # Show raw response for debugging
             st.markdown("##### Raw LLM Response:")
-            with st.expander("View Full Response", expanded=True):
+            with st.expander("View Full Response", expanded=False):
                 st.text_area("", value=parsed['raw_response'], height=400)
             
             # Helpful tips
