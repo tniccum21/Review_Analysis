@@ -1623,21 +1623,13 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     available_agg_columns = []
     column_display_names = {}
     
-    # Check for aggregation columns - looking for the actual column names from products.csv
+    # ONLY the 5 aggregation columns requested by user
     potential_columns = {
         'GENDER_TEXT': 'Gender',
-        'GENDER_CODE': 'Gender Code',
-        'STYLE_CODE': 'Style Code',
-        'STYLE_TEXT': 'Style', 
-        'PRODUCT_SUB_CLASS_TEXT': 'Product Sub-Class',
-        'PRODUCT_SUB_CLASS_CODE': 'Product Sub-Class Code',
         'PRODUCT_CLASS_TEXT': 'Product Class',
-        'PRODUCT_CLASS_CODE': 'Product Class Code',
+        'PRODUCT_SUB_CLASS_TEXT': 'Product Sub-Class',
         'END_USE_TEXT': 'End Use',
-        'END_USE_CODE': 'End Use Code',
-        'BRAND_TEXT': 'Brand',
-        'COLLECTION_TEXT': 'Collection',
-        'SEASON_TEXT': 'Season'
+        'STYLE_CODE': 'Style Code'
     }
     
     # Check which columns actually exist in the dataframe
@@ -1651,10 +1643,6 @@ def create_ai_analysis_tab(df: pd.DataFrame):
     # Always include product-level as an option
     available_agg_columns.append('product')
     column_display_names['product'] = 'Individual Product'
-    
-    # Debug: Show what columns were found
-    if len(available_agg_columns) <= 2:  # Only product and one other
-        st.warning(f"Limited aggregation options found. Available columns in data: {', '.join([c for c in df.columns if 'TEXT' in c or 'CODE' in c][:10])}")
     
     # Configuration section
     with st.expander("⚙️ AI Analysis Configuration", expanded=False):
@@ -2048,12 +2036,11 @@ def main():
         
         # Add CODE columns for filtering
         code_columns = ['GENDER_CODE', 'PRODUCT_CLASS_CODE', 'PRODUCT_SUB_CLASS_CODE', 
-                       'END_USE_CODE', 'SIZE_CODE', 'STYLE_CODE']
+                       'END_USE_CODE', 'SIZE_CODE']
         
-        # Add TEXT columns for aggregation and display
+        # Add the 5 TEXT columns requested for aggregation
         text_columns = ['GENDER_TEXT', 'PRODUCT_CLASS_TEXT', 'PRODUCT_SUB_CLASS_TEXT', 
-                       'END_USE_TEXT', 'BRAND_TEXT', 'COLLECTION_TEXT', 'SEASON_TEXT',
-                       'STYLE_CODE_AND_TEXT', 'STYLE_TEXT']
+                       'END_USE_TEXT', 'STYLE_CODE', 'STYLE_CODE_AND_TEXT']
         
         # Only include columns that exist in the products_df
         available_columns = merge_columns.copy()
