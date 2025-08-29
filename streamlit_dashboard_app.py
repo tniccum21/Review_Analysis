@@ -18,6 +18,10 @@ import json
 import requests
 import numpy as np
 from scipy import stats
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 try:
     from wordcloud import WordCloud
     import matplotlib.pyplot as plt
@@ -1206,17 +1210,35 @@ def create_wordcloud_visualization(df: pd.DataFrame):
     except Exception as e:
         st.error(f"Error generating word cloud: {e}")
 
-def fetch_available_models():
+def fetch_available_models(api_url=None):
     """Fetch available models from LM Studio - consistent with analyze app"""
-    lm_studio_host = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+    # Get timeout from environment variable
+    timeout = int(os.getenv("LLM_MODEL_FETCH_TIMEOUT", "10"))
+    
+    # If an api_url is provided, extract the base URL from it
+    if api_url:
+        # Remove the /v1/chat/completions part if present
+        if '/v1/chat/completions' in api_url:
+            base_url = api_url.replace('/v1/chat/completions', '')
+        elif '/v1' in api_url:
+            base_url = api_url.rsplit('/v1', 1)[0]
+        else:
+            base_url = api_url
+    else:
+        # Fall back to environment variable
+        base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+    
     try:
-        response = requests.get(f"{lm_studio_host}/v1/models", timeout=3)
+        # Try to fetch models from the /v1/models endpoint
+        models_url = f"{base_url}/v1/models"
+        response = requests.get(models_url, timeout=timeout)
         if response.status_code == 200:
             models_data = response.json()
             if 'data' in models_data:
                 return [model['id'] for model in models_data['data']]
-    except requests.exceptions.RequestException:
-        pass
+    except requests.exceptions.RequestException as e:
+        # Optionally log the error for debugging
+        print(f"Error fetching models: {e}")
     return []
 
 def compute_ai_metrics(df: pd.DataFrame, granularity: str = 'week', aggregation_level: str = 'product') -> Dict[str, Any]:
@@ -1519,8 +1541,11 @@ def call_llm_api(system_prompt: str, user_prompt: str, model_config: Dict[str, s
     else:
         data['temperature'] = temperature
     
+    # Get timeout from environment variable
+    timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
+    
     try:
-        response = requests.post(api_url, headers=headers, json=data, timeout=300)  # 5 minutes for large models
+        response = requests.post(api_url, headers=headers, json=data, timeout=timeout)
         response.raise_for_status()
         result = response.json()
         
@@ -1707,8 +1732,111 @@ def parse_llm_response(response: str) -> Dict[str, Any]:
         'raw_response': response
     }
 
+def build_chat_context(df: pd.DataFrame) -> str:
+    """Build context about the current data for the chat"""
+    context_parts = []
+    
+    # Basic statistics
+    context_parts.append(f"Dataset Overview:")
+    context_parts.append(f"- Total reviews: {len(df):,}")
+    context_parts.append(f"- Date range: {df['date'].min().strftime('%Y-%m-%d')} to {df['date'].max().strftime('%Y-%m-%d')}")
+    context_parts.append(f"- Average rating: {df['rating'].mean():.2f}")
+    
+    # Product information
+    unique_products = df['product'].nunique()
+    context_parts.append(f"- Unique products: {unique_products}")
+    
+    # Top products by review count
+    top_products = df['product'].value_counts().head(10)
+    context_parts.append("\nTop 10 products by review count:")
+    for product, count in top_products.items():
+        avg_rating = df[df['product'] == product]['rating'].mean()
+        context_parts.append(f"  - {product}: {count} reviews, {avg_rating:.2f} avg rating")
+    
+    # Style information if available
+    if 'STYLE_CODE' in df.columns:
+        unique_styles = df['STYLE_CODE'].nunique()
+        context_parts.append(f"\n- Unique styles: {unique_styles}")
+        
+        # Top styles by review count
+        top_styles = df['STYLE_CODE'].value_counts().head(10)
+        context_parts.append("\nTop 10 styles by review count:")
+        for style, count in top_styles.items():
+            if pd.notna(style):
+                avg_rating = df[df['STYLE_CODE'] == style]['rating'].mean()
+                sentiment_dist = df[df['STYLE_CODE'] == style]['sentiment'].value_counts()
+                context_parts.append(f"  - {style}: {count} reviews, {avg_rating:.2f} avg rating")
+                if not sentiment_dist.empty:
+                    context_parts.append(f"    Sentiment: {dict(sentiment_dist)}")
+    
+    # Problem categories summary
+    if 'problems_mentioned' in df.columns:
+        all_problems = []
+        for problems in df['problems_mentioned'].dropna():
+            if isinstance(problems, str):
+                try:
+                    problems_list = eval(problems) if problems.startswith('[') else [problems]
+                    all_problems.extend(problems_list)
+                except:
+                    pass
+        if all_problems:
+            problem_counts = pd.Series(all_problems).value_counts().head(10)
+            context_parts.append("\nTop 10 problems mentioned:")
+            for problem, count in problem_counts.items():
+                context_parts.append(f"  - {problem}: {count} mentions")
+    
+    # Positive mentions summary
+    if 'positive_mentions' in df.columns:
+        all_positives = []
+        for positives in df['positive_mentions'].dropna():
+            if isinstance(positives, str):
+                try:
+                    positives_list = eval(positives) if positives.startswith('[') else [positives]
+                    all_positives.extend(positives_list)
+                except:
+                    pass
+        if all_positives:
+            positive_counts = pd.Series(all_positives).value_counts().head(10)
+            context_parts.append("\nTop 10 positive aspects mentioned:")
+            for positive, count in positive_counts.items():
+                context_parts.append(f"  - {positive}: {count} mentions")
+    
+    return "\n".join(context_parts)
+
+def handle_chat_query(query: str, df: pd.DataFrame, model_config: Dict[str, str]) -> str:
+    """Handle a chat query about the data"""
+    
+    # Build context about the current data
+    data_context = build_chat_context(df)
+    
+    # Create system prompt for chat
+    system_prompt = f"""You are an AI assistant specialized in analyzing product review data. 
+You have access to the following information about the current dataset:
+
+{data_context}
+
+Based on this data, provide insightful, data-driven answers to questions about:
+- Product performance and ratings
+- Style strengths and weaknesses
+- Customer sentiment and feedback patterns
+- Problem areas and positive aspects
+- Trends and comparisons between products/styles
+
+Always base your answers on the actual data provided. If asked about something not in the data, 
+acknowledge the limitation. Provide specific examples and numbers when relevant."""
+
+    # User's query
+    user_prompt = query
+    
+    # Call the LLM
+    try:
+        response = call_llm_api(system_prompt, user_prompt, model_config)
+        return response
+    except Exception as e:
+        return f"Error processing your query: {str(e)}"
+
 def create_ai_analysis_tab(df: pd.DataFrame):
-    """Create the AI-powered analysis tab"""
+    """Create the AI-powered analysis tab with chat functionality"""
     
     st.markdown("#### 🤖 AI-Powered Analysis")
     
@@ -1777,145 +1905,52 @@ def create_ai_analysis_tab(df: pd.DataFrame):
                 help="Minimum reviews required for statistical significance"
             )
     
-    # LLM Configuration with Environment Variable Defaults
-    st.markdown("##### 🔧 LLM Configuration")
+    # LLM Configuration Status (Read-only from .env)
+    st.markdown("##### 🔧 LLM Configuration Status")
     
-    # Get defaults from environment variables (AI-specific, with fallback to generic)
-    default_provider = os.getenv("AI_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "LM Studio (Local)"))
-    default_api_url = os.getenv("AI_LLM_API_URL", os.getenv("LLM_API_URL", ""))
-    default_api_key = os.getenv("AI_LLM_API_KEY", os.getenv("LLM_API_KEY", ""))
-    default_model = os.getenv("AI_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
-    default_temperature = float(os.getenv("AI_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.1")))
+    # Get configuration from environment variables (AI-specific, with fallback to generic)
+    provider = os.getenv("AI_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "LM Studio (Local)"))
+    api_url = os.getenv("AI_LLM_API_URL", os.getenv("LLM_API_URL", "http://localhost:1234/v1/chat/completions"))
+    api_key = os.getenv("AI_LLM_API_KEY", os.getenv("LLM_API_KEY", "not-needed"))
+    model_id = os.getenv("AI_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
+    temperature = float(os.getenv("AI_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.1")))
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Provider selection
-        provider_options = ["LM Studio (Local)", "OpenAI", "Custom API"]
-        provider_index = 0
-        if default_provider in provider_options:
-            provider_index = provider_options.index(default_provider)
-        
-        provider = st.selectbox(
-            "LLM Provider:",
-            provider_options,
-            index=provider_index,
-            key="ai_provider_select",
-            help="Set AI_LLM_PROVIDER env var to change default"
-        )
-        
-        if provider == "LM Studio (Local)":
-            # Use environment variable with fallback
-            base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
-            # Only use env var if it's explicitly set for AI or generic LLM
-            if default_api_url and not default_api_url.startswith("http://169.254"):
-                default_url = default_api_url
-            else:
-                default_url = f"{base_url}/v1/chat/completions"
-            api_url = st.text_input(
-                "API URL:",
-                value=default_url,
-                key="ai_api_url_lmstudio",
-                help="Set AI_LLM_API_URL or LM_STUDIO_HOST env var to change default"
-            )
-            api_key = default_api_key or "not-needed"
-        elif provider == "OpenAI":
-            # For OpenAI, always use OpenAI endpoint unless explicitly overridden
-            api_url = st.text_input(
-                "API URL:",
-                value="https://api.openai.com/v1/chat/completions",
-                key="ai_api_url_openai",
-                help="OpenAI endpoint (usually doesn't need changing)"
-            )
-            api_key = st.text_input(
-                "API Key:",
-                value=default_api_key,
-                type="password",
-                key="ai_api_key_openai",
-                help="Set AI_LLM_API_KEY env var to avoid entering each time"
-            )
-        else:
-            api_url = st.text_input(
-                "API URL:",
-                value=default_api_url,
-                key="ai_api_url_custom",
-                help="Set AI_LLM_API_URL env var to change default"
-            )
-            api_key = st.text_input(
-                "API Key:",
-                value=default_api_key,
-                type="password",
-                key="ai_api_key_custom",
-                help="Set AI_LLM_API_KEY env var to avoid entering each time"
-            )
-    
-    with col2:
-        # Try to fetch available models using the same function as analyze app
-        available_models = []
-        if provider == "LM Studio (Local)":
-            available_models = fetch_available_models()
-        
+    # Check connection status
+    connection_status = "🔴 Not Connected"
+    available_models = []
+    if provider == "LM Studio (Local)":
+        available_models = fetch_available_models(api_url)
         if available_models:
-            # Try to find default model in available models
-            model_index = 0
-            if default_model in available_models:
-                model_index = available_models.index(default_model)
-            
-            model_id = st.selectbox(
-                "Model:",
-                available_models,
-                index=model_index,
-                key="ai_model_select_lmstudio",
-                help="Set AI_LLM_MODEL_ID env var to change default"
-            )
+            connection_status = f"✅ Connected ({len(available_models)} models available)"
         else:
-            # Use environment variable or provider-specific default
-            if provider == "OpenAI":
-                # For OpenAI, default to gpt-4 unless env var is set
-                model_value = default_model if default_model and default_model.startswith("gpt") else "gpt-4"
-            elif provider == "LM Studio (Local)":
-                model_value = default_model or "gemma-2-9b-it"
-            else:
-                model_value = default_model or "gpt-4"
-            
-            # Use fixed keys based on provider to ensure proper widget updates
-            if provider == "OpenAI":
-                widget_key = "ai_model_input_openai"
-            elif provider == "LM Studio (Local)":
-                widget_key = "ai_model_input_lmstudio"
-            else:
-                widget_key = "ai_model_input_custom"
-            
-            model_id = st.text_input(
-                "Model ID:",
-                value=model_value,
-                key=widget_key,
-                help="Set AI_LLM_MODEL_ID env var to change default"
-            )
+            connection_status = "⚠️ Unable to connect to LLM server"
+    
+    # Display configuration in a clean info box
+    with st.container():
+        col1, col2 = st.columns(2)
         
-        # Temperature slider with fixed keys
-        if provider == "OpenAI":
-            temp_key = "ai_temperature_openai"
-        elif provider == "LM Studio (Local)":
-            temp_key = "ai_temperature_lmstudio"
-        else:
-            temp_key = "ai_temperature_custom"
-            
-        # Temperature slider with provider-specific help text
-        if provider == "OpenAI":
-            help_text = "Note: Some OpenAI models (like o1) only support temperature=1.0"
-        else:
-            help_text = "Set AI_LLM_TEMPERATURE env var to change default (Lower = more focused, Higher = more creative)"
+        with col1:
+            st.info(f"""
+            **Provider:** {provider}  
+            **Model:** {model_id}  
+            **Temperature:** {temperature}
+            """)
         
-        temperature = st.slider(
-            "Temperature:",
-            min_value=0.0,
-            max_value=1.0,
-            value=default_temperature if provider != "OpenAI" else 1.0,
-            step=0.05,
-            key=temp_key,
-            help=help_text
-        )
+        with col2:
+            st.info(f"""
+            **Status:** {connection_status}  
+            **Server:** {api_url.split('/v1')[0] if '/v1' in api_url else api_url}  
+            """)
+        
+        if not available_models and provider == "LM Studio (Local)":
+            st.warning("""
+            ⚠️ Cannot connect to LLM server. Please check:
+            1. Your LLM server is running at the configured address
+            2. The server URL in .env file is correct
+            3. Your model is loaded in the server
+            """)
+        
+        st.caption("💡 To change configuration, edit the `.env` file and restart the app")
     
     # Analysis button and results
     if st.button("🚀 Generate AI Analysis", type="primary"):
@@ -2214,6 +2249,81 @@ def create_ai_analysis_tab(df: pd.DataFrame):
         
         # Reset the flag after analysis is complete
         st.session_state.ai_analysis_in_progress = False
+    
+    # Chat Section - Interactive Q&A about the data
+    st.markdown("---")
+    st.markdown("### 💬 Ask Questions About Your Data")
+    st.info("Chat with AI about your review data. Ask about specific products, styles, trends, or comparisons.")
+    
+    # Initialize chat history in session state if not exists
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Sample questions for quick selection
+    sample_questions = {
+        "📊 Style Analysis": "What are the strengths and weaknesses of the most reviewed styles?",
+        "🔍 Product Comparison": "Compare the top 5 products by rating and sentiment",
+        "📈 Trend Analysis": "What are the main trends in customer feedback over time?",
+        "❌ Problem Areas": "What are the most common problems customers mention?",
+        "✨ Top Performers": "Which products have the highest customer satisfaction and why?",
+        "🎯 Recommendations": "What improvements would you recommend based on customer feedback?"
+    }
+    
+    # Create container for sample questions
+    with st.expander("💡 Sample Questions", expanded=False):
+        st.markdown("Click any question below to use it:")
+        for label, question in sample_questions.items():
+            st.code(question, language=None)
+    
+    # Text input for user query
+    user_query = st.text_area(
+        "Ask a question about your data:",
+        placeholder="e.g., 'What are the strengths and weaknesses of the W303 style?' or 'Compare the sentiment for different product classes'",
+        height=100,
+        key="chat_query_input"
+    )
+    
+    # Submit button for the chat
+    if st.button("🤖 Ask AI", type="primary", use_container_width=True):
+        if user_query:
+            # Show spinner while processing
+            with st.spinner("Analyzing your question..."):
+                # Prepare model configuration
+                model_config = {
+                    'provider': provider,
+                    'api_url': api_url,
+                    'api_key': api_key,
+                    'model_id': model_id,
+                    'temperature': temperature
+                }
+                
+                # Get response from chat handler
+                response = handle_chat_query(user_query, df, model_config)
+                
+                # Add to chat history
+                st.session_state.chat_history.append({
+                    'question': user_query,
+                    'answer': response
+                })
+        else:
+            st.warning("Please enter a question to ask about the data.")
+    
+    # Display chat history
+    if st.session_state.chat_history:
+        st.markdown("#### 📜 Chat History")
+        
+        # Add clear history button
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
+        
+        # Display conversation history in reverse order (newest first)
+        for i, chat in enumerate(reversed(st.session_state.chat_history)):
+            with st.expander(f"Q{len(st.session_state.chat_history)-i}: {chat['question'][:100]}...", expanded=(i==0)):
+                st.markdown("**Question:**")
+                st.write(chat['question'])
+                st.markdown("**Answer:**")
+                st.write(chat['answer'])
     
     # Help section
     with st.expander("ℹ️ About AI Analysis"):

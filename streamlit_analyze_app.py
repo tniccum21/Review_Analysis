@@ -13,6 +13,10 @@ import time
 from datetime import datetime
 from typing import List, Dict, Optional
 import requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 st.set_page_config(
     page_title="Review Analyzer - Analysis",
@@ -74,16 +78,35 @@ def _extract_json_from_text(text: str) -> Optional[str]:
     except Exception:
         return None
 
-def fetch_available_models():
-    lm_studio_host = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+def fetch_available_models(api_url=None):
+    """Fetch available models from LM Studio"""
+    # Get timeout from environment variable
+    timeout = int(os.getenv("LLM_MODEL_FETCH_TIMEOUT", "10"))
+    
+    # If an api_url is provided, extract the base URL from it
+    if api_url:
+        # Remove the /v1/chat/completions part if present
+        if '/v1/chat/completions' in api_url:
+            base_url = api_url.replace('/v1/chat/completions', '')
+        elif '/v1' in api_url:
+            base_url = api_url.rsplit('/v1', 1)[0]
+        else:
+            base_url = api_url
+    else:
+        # Fall back to environment variable
+        base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
+    
     try:
-        response = requests.get(f"{lm_studio_host}/v1/models", timeout=3)
+        # Try to fetch models from the /v1/models endpoint
+        models_url = f"{base_url}/v1/models"
+        response = requests.get(models_url, timeout=timeout)
         if response.status_code == 200:
             models_data = response.json()
             if 'data' in models_data:
                 return [model['id'] for model in models_data['data']]
-    except requests.exceptions.RequestException:
-        pass
+    except requests.exceptions.RequestException as e:
+        # Optionally log the error for debugging
+        print(f"Error fetching models: {e}")
     return []
 
 def initialize_session_state():
@@ -645,60 +668,47 @@ def model_configuration_sidebar():
             st.error("❌ Backend unavailable. Check process_reviews.py")
             return
         
-        # Get defaults from environment variables (ANALYZE-specific, with fallback to generic)
-        default_model = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
-        default_temperature = float(os.getenv("ANALYZE_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
+        # Get configuration from environment variables (ANALYZE-specific, with fallback to generic)
+        model_id = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
+        temperature = float(os.getenv("ANALYZE_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
+        api_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
         
-        # Initialize model_config with defaults if not already set
-        if 'model_id' not in st.session_state.model_config:
-            st.session_state.model_config['model_id'] = default_model
-        if 'temperature' not in st.session_state.model_config:
-            st.session_state.model_config['temperature'] = default_temperature
+        # Set model config in session state from environment
+        st.session_state.model_config['model_id'] = model_id
+        st.session_state.model_config['temperature'] = temperature
         
-        st.info("Ensure your LLM host (e.g., LM Studio) is running on port 1234")
-        
-        available_models = fetch_available_models()
+        # Check connection status
+        available_models = fetch_available_models(f"{api_url}/v1/chat/completions")
         
         if available_models:
-            st.success(f"✅ Connected ({len(available_models)} models)")
-            
-            current_model = st.session_state.model_config.get('model_id', default_model)
-            if current_model not in available_models and available_models:
-                current_model = available_models[0]
-                st.session_state.model_config['model_id'] = current_model
-            
-            try:
-                current_index = available_models.index(current_model) if current_model in available_models else 0
-            except ValueError:
-                current_index = 0
-            
-            st.session_state.model_config['model_id'] = st.selectbox(
-                "Select Model",
-                options=available_models,
-                index=current_index,
-                help="Set ANALYZE_LLM_MODEL_ID env var to change default"
-            )
+            connection_status = f"✅ Connected ({len(available_models)} models)"
+            connection_color = "green"
         else:
-            st.warning("⚠️ No connection. Enter manually:")
-            st.session_state.model_config['model_id'] = st.text_input(
-                "Model ID",
-                value=st.session_state.model_config.get('model_id', default_model),
-                help="Set ANALYZE_LLM_MODEL_ID env var to change default"
-            )
+            connection_status = "⚠️ Not connected"
+            connection_color = "orange"
         
-        st.session_state.model_config['temperature'] = st.slider(
-            "Temperature",
-            0.0, 1.0,
-            st.session_state.model_config.get('temperature', default_temperature),
-            0.01,
-            help="Set ANALYZE_LLM_TEMPERATURE env var to change default (0.0 for deterministic, consistent results)"
-        )
+        # Display configuration status
+        st.info(f"""
+        **Status:** {connection_status}  
+        **Server:** {api_url}  
+        **Model:** {model_id}  
+        **Temperature:** {temperature}
+        """)
+        
+        if not available_models:
+            st.warning("""
+            Cannot connect to LLM server. Check:
+            1. Server is running at configured address
+            2. Model is loaded in the server
+            3. .env file has correct settings
+            """)
         
         if st.button("🔄 Refresh Connection"):
             st.rerun()
         
         st.divider()
-        st.caption("💡 Tip: Use the dashboard app to visualize results after analysis.")
+        st.caption("💡 Configuration is set in `.env` file")
+        st.caption("📊 Use dashboard app to visualize results")
 
 def main():
     initialize_session_state()

@@ -7,6 +7,10 @@ import json
 import os
 from typing import List, Dict, Any, Tuple, Optional
 import requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- NEW: Helper function to robustly find JSON in a string ---
 def _extract_json_from_text(text: str) -> Optional[str]:
@@ -70,6 +74,9 @@ def analyze_review_with_llm(review_text: str, rating: Any, prompt: str, model_co
     base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
     user_content = f"Star Rating: {rating}/5\nReview Text: \"{review_text}\""
     
+    # Get timeout from environment variable
+    timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
+    
     try:
         response = requests.post(
             f"{base_url}/v1/chat/completions",
@@ -84,7 +91,7 @@ def analyze_review_with_llm(review_text: str, rating: Any, prompt: str, model_co
                 "temperature": model_config['temperature'],
                 # --- MODIFIED: Removed "response_format" for wider compatibility ---
             },
-            timeout=45
+            timeout=timeout
         )
         response.raise_for_status() # This will raise an HTTPError for non-2xx responses
 
