@@ -1443,7 +1443,7 @@ def prepare_llm_payload(metrics: Dict[str, Any], top_n_groups: int = 20) -> Dict
 def create_ai_analysis_prompt(payload: Dict[str, Any]) -> tuple[str, str]:
     """Create the structured prompt for LLM analysis"""
     
-    system_prompt = """You are a business intelligence assistant helping retail executives understand customer feedback trends.
+    system_prompt = """You are a business analyst helping retail executives understand customer feedback trends.
 Write in clear, non-technical business language. Avoid statistical jargon like z-scores, p-values, or standard deviations.
 Focus on what matters to business leaders: customer satisfaction changes, emerging issues, and actionable insights.
 Output ONLY the requested JSON structure followed by a business executive summary."""

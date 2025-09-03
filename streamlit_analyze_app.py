@@ -121,9 +121,12 @@ def initialize_session_state():
     if 'processing_errors' not in st.session_state:
         st.session_state.processing_errors = []
     if 'model_config' not in st.session_state:
+        # Get model configuration from environment variables only
+        model_id = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", ""))
+        temperature = float(os.getenv("ANALYZE_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
         st.session_state.model_config = {
-            'model_id': 'gemma-2-9b-it',
-            'temperature': 0.0
+            'model_id': model_id,  # No hard-coded default, use .env file
+            'temperature': temperature
         }
     if 'is_processing' not in st.session_state:
         st.session_state.is_processing = False
@@ -308,7 +311,7 @@ def match_csv_fields_to_analysis_fields(csv_columns: List[str], model_config: di
                 if col in sample_df.columns:
                     sample_values = sample_df[col].head(2).tolist()
                     sample_preview.append(f"{col}: {sample_values}")
-            sample_data_str = f"\n\nSample Data:\n" + "\n".join(sample_preview)
+            sample_data_str = "\n\nSample Data:\n" + "\n".join(sample_preview)
         
         prompt = f"""Map these CSV columns to review analysis fields. Return ONLY a JSON object.
 
@@ -326,16 +329,30 @@ Return JSON: {{"product": "column_name", "rating": "column_name", "date": "colum
 
         base_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
         
+        # Try to get the actual loaded model from LM Studio
+        available_models = fetch_available_models(base_url)
+        model_to_use = model_config.get('model_id', '')
+        
+        # If no model specified or configured model is not available, use the first available model
+        if available_models and (not model_to_use or model_to_use not in available_models):
+            model_to_use = available_models[0]
+            st.info(f"Using available model: {model_to_use}")
+        
+        # If still no model, we can't proceed
+        if not model_to_use:
+            st.error("No model specified in .env file and no models available in LM Studio. Please configure LLM_MODEL_ID in your .env file.")
+            return {}
+        
         response = requests.post(
             f"{base_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
             json={
-                "model": model_config.get('model_id', 'local-model'),
+                "model": model_to_use,
                 "messages": [
-                    {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                    {"role": "system", "content": "You are a helpful assistant that outputs ONLY valid JSON. Do not include any reasoning or explanation, just the JSON object."},
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 200,
+                "max_tokens": 1500,  # Increased from 200 to allow complete response
                 "temperature": 0.1,
                 "stream": False
             },
@@ -345,7 +362,17 @@ Return JSON: {{"product": "column_name", "rating": "column_name", "date": "colum
         if response.status_code == 200:
             response_data = response.json()
             if 'choices' in response_data and len(response_data['choices']) > 0:
-                response_text = response_data['choices'][0]['message']['content']
+                message = response_data['choices'][0]['message']
+                
+                # Try to get content from 'content' field first, then 'reasoning' field
+                response_text = message.get('content', '')
+                if not response_text and 'reasoning' in message:
+                    response_text = message.get('reasoning', '')
+                
+                # If still no content, report the error
+                if not response_text:
+                    st.error("LLM returned empty response. Please map fields manually.")
+                    return {}
                 
                 # Extract JSON from response
                 json_string = _extract_json_from_text(response_text)
@@ -363,14 +390,17 @@ Return JSON: {{"product": "column_name", "rating": "column_name", "date": "colum
                     except json.JSONDecodeError:
                         st.error("LLM returned invalid JSON. Please map fields manually.")
         else:
-            st.error(f"LLM API error (status {response.status_code}). Please map fields manually.")
+            error_msg = f"LLM API error (status {response.status_code})"
+            if response.status_code == 400:
+                error_msg += f". Response: {response.text[:200]}"
+            st.error(f"{error_msg}. Please map fields manually.")
             
     except requests.exceptions.ConnectionError as e:
-        st.error("Cannot connect to LM Studio. Please ensure it's running and try again.")
+        st.error("Cannot connect to LM Studio. Please ensure it's running at http://localhost:1234 and try again.")
     except requests.exceptions.Timeout:
         st.error("LM Studio request timed out. Please try again.")
     except Exception as e:
-        st.error(f"Error calling LLM: {str(e)}")
+        st.error(f"Error calling LLM: {str(e)}. Please map fields manually.")
     
     return {}
 
@@ -669,7 +699,7 @@ def model_configuration_sidebar():
             return
         
         # Get configuration from environment variables (ANALYZE-specific, with fallback to generic)
-        model_id = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", "gemma-2-9b-it"))
+        model_id = os.getenv("ANALYZE_LLM_MODEL_ID", os.getenv("LLM_MODEL_ID", ""))
         temperature = float(os.getenv("ANALYZE_LLM_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
         api_url = os.getenv("LM_STUDIO_HOST", "http://localhost:1234")
         
