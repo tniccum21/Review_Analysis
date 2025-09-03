@@ -38,7 +38,7 @@ def create_extraction_config(
 ```python
 prompt = create_extraction_config(
     valid_categories=["Fit", "Comfort", "Size", "Material"],
-    model_id="gemma2:2b",
+    model_id="gpt-oss-20b",  # From .env or auto-selected
     temperature=0.0
 )
 ```
@@ -55,7 +55,7 @@ def analyze_review_with_llm(
     rating: Any,
     prompt: str,
     model_config: Dict[str, Any]
-) -> Tuple[str, List[str]]
+) -> Tuple[str, List[str], List[str]]
 ```
 
 **Parameters:**
@@ -65,22 +65,23 @@ def analyze_review_with_llm(
 - `model_config`: Model configuration dictionary
 
 **Returns:**
-- `Tuple[str, List[str]]`: (sentiment, problems_list)
+- `Tuple[str, List[str], List[str]]`: (sentiment, problems_list, positives_list)
   - `sentiment`: "Positive", "Negative", or "Neutral"
   - `problems_list`: List of identified problem categories
+  - `positives_list`: List of identified positive features
 
 **Example:**
 ```python
-sentiment, problems = analyze_review_with_llm(
+sentiment, problems, positives = analyze_review_with_llm(
     review_text="Product is comfortable but expensive",
     rating=3,
     prompt=prompt,
     model_config={
-        "model_id": "gemma2:2b",
+        "model_id": "gpt-oss-20b",  # Or auto-selected from LM Studio
         "temperature": 0.0
     }
 )
-# Returns: ("Neutral", ["Price"])
+# Returns: ("Neutral", ["Price"], ["Comfort"])
 ```
 
 ---
@@ -354,8 +355,9 @@ Standard columns:
 - `date`: Review date
 - `product`: Product identifier
 - `rating`: Original rating
-- `Overall review sentiment`: Sentiment classification
-- `problems_mentioned`: Semicolon-separated categories
+- `sentiment`: Sentiment classification (Positive/Negative/Neutral)
+- `problems_mentioned`: Semicolon-separated categories or "None"
+- `positive_mentions`: Semicolon-separated positive features or "None"
 - `original_text`: Original review text
 
 ---
@@ -366,21 +368,29 @@ Standard columns:
 
 ```bash
 # LM Studio host URL
-LM_STUDIO_HOST=http://localhost:1234
+LM_STUDIO_HOST=http://169.254.11.42:1234
 
-# Model configuration
-MODEL_ID=gemma2:2b
-TEMPERATURE=0.0
+# Request timeouts
+LLM_REQUEST_TIMEOUT=3000
+LLM_MODEL_FETCH_TIMEOUT=10
+
+# Review Analysis App configuration
+ANALYZE_LLM_MODEL_ID=gpt-oss-20b  # Or leave empty for auto-select
+ANALYZE_LLM_TEMPERATURE=0.0
+
+# AI Dashboard App configuration  
+AI_LLM_MODEL_ID=gpt-oss-120b  # Or leave empty for auto-select
+AI_LLM_TEMPERATURE=0.1
 ```
 
 ### Model Configuration Object
 
 ```python
 model_config = {
-    'model_id': 'gemma2:2b',
+    'model_id': 'gpt-oss-20b',  # From .env or auto-selected
     'temperature': 0.0,
-    'max_tokens': 500,
-    'timeout': 45
+    'max_tokens': 1500,  # Increased for better completions
+    'timeout': 300  # From LLM_REQUEST_TIMEOUT env var
 }
 ```
 
@@ -389,15 +399,18 @@ model_config = {
 Request format for LM Studio:
 ```python
 {
-    "model": "gemma2:2b",
+    "model": "gpt-oss-20b",  # Or any loaded model
     "messages": [
         {"role": "system", "content": "prompt"},
         {"role": "user", "content": "content"}
     ],
-    "max_tokens": 500,
+    "max_tokens": 1500,  # Higher for complete responses
     "temperature": 0.0
 }
 ```
+
+**Model Auto-Selection:**
+If no model is specified in .env, the system queries `/v1/models` endpoint and auto-selects the first available model.
 
 ---
 
@@ -427,15 +440,19 @@ except ValueError as e:
     print(f"Data parsing error: {e}")
 ```
 
-#### `RuntimeError`
+#### Error Recovery
 
-Raised for general processing errors.
+**IMPORTANT:** The `analyze_review_with_llm()` function **never raises exceptions**. It always returns safe defaults to ensure 100% review processing.
 
 ```python
-try:
-    process_reviews_batch(...)
-except RuntimeError as e:
-    print(f"Processing error: {e}")
+# This function always succeeds
+sentiment, problems, positives = analyze_review_with_llm(
+    review_text="Any review text",
+    rating=3,
+    prompt=prompt,
+    model_config=config
+)
+# On any error, returns: ("Neutral", [], [])
 ```
 
 ### Error Recovery Strategies
@@ -453,13 +470,11 @@ except RuntimeError as e:
            time.sleep(2 ** attempt)
    ```
 
-2. **Fallback Values**
+2. **Built-in Error Recovery**
    ```python
-   try:
-       sentiment, problems = analyze_review_with_llm(...)
-   except Exception:
-       sentiment = "Neutral"
-       problems = []
+   # No try/except needed - function handles all errors internally
+   sentiment, problems, positives = analyze_review_with_llm(...)
+   # Always returns valid data, never skips reviews
    ```
 
 3. **Batch Error Handling**
@@ -493,9 +508,16 @@ df = pd.read_csv('reviews.csv')
 
 # Configure extraction
 categories = get_valid_problem_categories()
+# Model ID from .env or auto-selected from LM Studio
+model_id = os.getenv("ANALYZE_LLM_MODEL_ID", "")
+if not model_id:
+    # Auto-select from available models
+    models = fetch_available_models()
+    model_id = models[0] if models else "gpt-oss-20b"
+
 prompt = create_extraction_config(
     valid_categories=categories,
-    model_id="gemma2:2b",
+    model_id=model_id,
     temperature=0.0
 )
 
@@ -503,16 +525,17 @@ prompt = create_extraction_config(
 results = []
 for _, row in df.iterrows():
     try:
-        sentiment, problems = analyze_review_with_llm(
+        sentiment, problems, positives = analyze_review_with_llm(
             review_text=row['review_text'],
             rating=row['rating'],
             prompt=prompt,
-            model_config={'model_id': 'gemma2:2b', 'temperature': 0.0}
+            model_config={'model_id': 'gpt-oss-20b', 'temperature': 0.0}
         )
         results.append({
             'product': row['product_id'],
             'sentiment': sentiment,
-            'problems': '; '.join(problems)
+            'problems': '; '.join(problems) if problems else 'None',
+            'positives': '; '.join(positives) if positives else 'None'
         })
     except Exception as e:
         print(f"Error: {e}")
@@ -553,7 +576,7 @@ custom_categories = [
 
 prompt = create_extraction_config(
     valid_categories=custom_categories,
-    model_id="gemma2:2b",
+    model_id=os.getenv("ANALYZE_LLM_MODEL_ID", "gpt-oss-20b"),
     temperature=0.0
 )
 ```
